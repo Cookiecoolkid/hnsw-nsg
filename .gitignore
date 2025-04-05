@@ -1,3 +1,12 @@
 dataset/
 **/build/
 efanna_graph/
+data/
+
+*.o
+*.a
+*.so
+*.log
+*.tmp
+*.swp
+*.swo
