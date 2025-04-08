@@ -4,7 +4,7 @@
 namespace hnsw_nsg {
 
 template<typename dist_t>
-class HNSW_NSG : public AlgorithmInterface<dist_t> {
+class HNSW_NSG {
 public:
     //////////////////////////////
     // 内嵌的原始结构实例 //
@@ -45,6 +45,20 @@ public:
         point_num_ = max_elements;
     }
 
+    HNSW_NSG(SpaceInterface<dist_t>* space, unsigned int dim, size_t max_elements, float* data, float* query_data,
+             const Parameters& parameters, std::string hnsw_index_path, std::string nsg_index_path) 
+             : hnsw_(space, hnsw_index_path),
+               nsg_(dim,max_elements, L2, nullptr) {
+        data_ = data;
+        query_data_ = query_data;
+        dim_ = dim;
+        parameters_ = parameters;
+        point_num_ = max_elements;
+
+        hnsw_.loadIndex(hnsw_index_path, space, max_elements);
+        nsg_.Load(nsg_index_path.c_str());
+    }
+
     //////////////////////////////
     // 析构函数（独立释放） //
     //////////////////////////////
@@ -61,7 +75,7 @@ public:
     //////////////////////////////
     // 插入逻辑（双向维护） //
     //////////////////////////////
-    void addPoint(const void* data_point, labeltype label, bool replace_deleted) override {
+    void addPoint(const void* data_point, labeltype label, bool replace_deleted) {
         // Step 1: 插入HNSW（所有层）
         hnsw_.addPoint(data_point, label, replace_deleted);
     }
@@ -73,36 +87,28 @@ public:
         }
     };
 
-    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    std::vector<unsigned>
     searchHybridLayer(tableint enterpoint, const void* query_data, size_t K, 
-                      BaseFilterFunctor* isIdAllowed) const {
+                      BaseFilterFunctor* isIdAllowed) {
         unsigned id = enterpoint;
 
         // 执行NSG搜索
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> nsg_result;
         std::vector<unsigned> indices(K);
         const float *query_float = static_cast<const float*>(query_data);
-        // nsg_.SearchFromEnterpoint(query_float, data_ ,K, parameters_, indices.data(), id);
-        nsg_.MySearch(query_float, data_, K, parameters_, indices.data());
+        nsg_.SearchFromEnterpoint(query_float, data_ ,K, parameters_, indices.data(), id);
+        // nsg_.MySearch(query_float, data_, K, parameters_, indices.data());
 
         res.push_back(indices);
 
-        for (size_t i = 0; i < indices.size(); i++) {
-            unsigned id = indices[i];
-            dist_t dist = hnsw_.fstdistfunc_(query_data, hnsw_.getDataByInternalId(id), hnsw_.dist_func_param_);
-            nsg_result.emplace(dist, id);
-        }
-
-        return nsg_result;
+        return indices;
     }
     //////////////////////////////
     // 搜索逻辑（分层处理） //
     //////////////////////////////
-    std::priority_queue<std::pair<dist_t, labeltype>> 
-    searchKnn(const void* query, size_t k, BaseFilterFunctor* filter) const override {
+    std::vector<unsigned>
+    searchKnn(const void* query, size_t k, BaseFilterFunctor* filter) {
         // Phase 1: HNSW上层搜索（L1及以上层）
-        std::priority_queue<std::pair<dist_t, labeltype >> result;
-        if (hnsw_.cur_element_count == 0) return result;
+        if (hnsw_.cur_element_count == 0) return {};
 
         tableint currObj = hnsw_.enterpoint_node_;
         dist_t curdist = hnsw_.fstdistfunc_(query, hnsw_.getDataByInternalId(hnsw_.enterpoint_node_), hnsw_.dist_func_param_);
@@ -134,22 +140,13 @@ public:
             }
         }
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-
-        top_candidates = searchHybridLayer(currObj, query, k, filter);
-
-        while (top_candidates.size() > k) {
-            top_candidates.pop();
-        }
-        while (top_candidates.size() > 0) {
-            std::pair<dist_t, tableint> rez = top_candidates.top();
-            result.push(std::pair<dist_t, labeltype>(rez.first, hnsw_.getExternalLabel(rez.second)));
-            top_candidates.pop();
-        }
-        return result;
+        // For layer 0
+        std::vector<unsigned> top_candidates;
+        top_candidates = searchHybridLayer(currObj, query, std::max(k, hnsw_.ef_), filter);
+        return top_candidates;
     }
 
-    void saveIndex(const std::string& location) override {
+    void saveIndex(const std::string& location) {
         // 保存HNSW索引
         hnsw_.saveIndex(location + "_hnsw.bin");
 
