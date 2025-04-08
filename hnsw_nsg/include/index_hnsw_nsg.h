@@ -1,195 +1,160 @@
-#include "efanna2e/index_nsg.h"
-#include "hnswlib/hnswalg.h"
+#include "nsg/index_nsg.h"
+#include "hnsw/hnswalg.h"
 
 namespace hnsw_nsg {
 
-using namespace hnswlib;
-using namespace efanna2e;
-
 template<typename dist_t>
-class HierarchicalNSG : public AlgorithmInterface<dist_t> {
-private:
-    // NSG相关数据结构
-    CompactGraph nsg_graph_;
-    unsigned nsg_ep_;
-    size_t nsg_width_;
-    Parameters nsg_params_;
-    
-    // HNSW原有结构扩展
-    std::vector<CompactGraph> layers_; // 每层的NSG图
-    std::vector<unsigned> entry_points_; // 每层入口点
+class HNSW_NSG : public AlgorithmInterface<dist_t> {
+public:
+    //////////////////////////////
+    // 内嵌的原始结构实例 //
+    //////////////////////////////
+    HierarchicalNSW<dist_t> hnsw_;
+    IndexNSG nsg_;
+
+    float* data_;
+    float* query_data_;
+    size_t dim_;
+    Parameters parameters_;
+    unsigned point_num_;
+
+    std::vector<std::vector<unsigned>> res;
+
+    //////////////////////////////
+    // 跨结构映射关系 //
+    //////////////////////////////
+
+    // 似乎不需要，直接分别构造加载，搜索时判读即可
+
+    // std::vector<tableint> hnsw_to_nsg_;  // HNSW节点到NSG节点的映射
+    // std::vector<tableint> nsg_to_hnsw_;  // NSG节点到HNSW节点的映射
 
 public:
-    HierarchicalNSW(SpaceInterface<dist_t>* s, const Parameters& params) 
-        : nsg_params_(params) {
-        // 初始化参数
-        nsg_width_ = params.Get<unsigned>("R");
-        nsg_ep_ = 0;
+    //////////////////////////////
+    // 构造函数（独立初始化） //
+    //////////////////////////////
+    HNSW_NSG(SpaceInterface<dist_t>* space, unsigned int dim, size_t max_elements, float* data, float* query_data,
+             const Parameters& parameters, unsigned hnsw_M = 16, size_t hnsw_ef_construction = 200, 
+             unsigned nsg_width = 20) 
+             : hnsw_(space, max_elements, hnsw_M, hnsw_ef_construction, 100, false), 
+               nsg_(dim,max_elements, L2, nullptr) {
+        data_ = data;
+        query_data_ = query_data;
+        dim_ = dim;
+        parameters_ = parameters;
+        point_num_ = max_elements;
     }
 
-    // 重写连接建立函数
-    tableint mutuallyConnectNewElement(
-        const void* data_point, tableint cur_c, 
-        std::priority_queue<std::pair<dist_t, tableint>>& top_candidates,
-        int level, bool isUpdate) override {
-        
-        // 使用NSG的同步剪枝策略
-        boost::dynamic_bitset<> flags(this->max_elements_, 0);
-        std::vector<Neighbor> pool;
-        std::vector<Neighbor> tmp;
+    //////////////////////////////
+    // 析构函数（独立释放） //
+    //////////////////////////////
+    ~HNSW_NSG() {}
 
-        // 获取NSG风格的邻居
-        this->get_nsg_neighbors(data_point, level, flags, tmp, pool);
-
-        // 执行NSG同步剪枝
-        SimpleNeighbor* cut_graph = new SimpleNeighbor[this->max_elements_ * nsg_width_];
-        this->sync_prune_nsg(cur_c, pool, flags, cut_graph);
-
-        // 建立互连
-        this->InterInsertNSG(cur_c, cut_graph);
-
-        delete[] cut_graph;
-        return select_entry_point(pool);
+    void setEf(size_t ef) {
+        hnsw_.ef_ = ef;
     }
 
-    // NSG风格的邻居获取
-    void get_nsg_neighbors(const void* query, int level, 
-                          boost::dynamic_bitset<>& flags,
-                          std::vector<Neighbor>& tmp,
-                          std::vector<Neighbor>& pool) {
-        // 实现NSG的候选集生成逻辑
-        unsigned L = nsg_params_.Get<unsigned>("L");
-        // ... NSG搜索逻辑 ...
+    void Build_NSG(const float* data, Parameters& parameters) {
+        nsg_.Build(point_num_, data, parameters);
     }
 
-    // NSG同步剪枝
-    void sync_prune_nsg(tableint q, std::vector<Neighbor>& pool,
-                      boost::dynamic_bitset<>& flags,
-                      SimpleNeighbor* cut_graph) {
-        // 实现NSG剪枝逻辑
-        unsigned range = nsg_params_.Get<unsigned>("R");
-        unsigned maxc = nsg_params_.Get<unsigned>("C");
-        // ... NSG剪枝逻辑 ...
+    //////////////////////////////
+    // 插入逻辑（双向维护） //
+    //////////////////////////////
+    void addPoint(const void* data_point, labeltype label, bool replace_deleted) override {
+        // Step 1: 插入HNSW（所有层）
+        hnsw_.addPoint(data_point, label, replace_deleted);
     }
+    
+    struct CompareByFirst {
+        constexpr bool operator()(std::pair<dist_t, tableint> const& a,
+            std::pair<dist_t, tableint> const& b) const noexcept {
+            return a.first < b.first;
+        }
+    };
 
-    // NSG互连插入
-    void InterInsertNSG(tableint n, SimpleNeighbor* cut_graph) {
-        // 实现NSG互连逻辑
-        std::vector<std::mutex> locks(this->max_elements_);
-        unsigned range = nsg_params_.Get<unsigned>("R");
-        // ... NSG互连逻辑 ...
+    std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+    searchHybridLayer(tableint enterpoint, const void* query_data, size_t K, 
+                      BaseFilterFunctor* isIdAllowed) const {
+        unsigned id = enterpoint;
+
+        // 执行NSG搜索
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> nsg_result;
+        std::vector<unsigned> indices(K);
+        const float *query_float = static_cast<const float*>(query_data);
+        // nsg_.SearchFromEnterpoint(query_float, data_ ,K, parameters_, indices.data(), id);
+        nsg_.MySearch(query_float, data_, K, parameters_, indices.data());
+
+        res.push_back(indices);
+
+        for (size_t i = 0; i < indices.size(); i++) {
+            unsigned id = indices[i];
+            dist_t dist = hnsw_.fstdistfunc_(query_data, hnsw_.getDataByInternalId(id), hnsw_.dist_func_param_);
+            nsg_result.emplace(dist, id);
+        }
+
+        return nsg_result;
     }
-
-    // 重写搜索逻辑
+    //////////////////////////////
+    // 搜索逻辑（分层处理） //
+    //////////////////////////////
     std::priority_queue<std::pair<dist_t, labeltype>> 
-    searchKnn(const void* query_data, size_t k, 
-             BaseFilterFunctor* filter = nullptr) const override {
-        
-        std::priority_queue<std::pair<dist_t, labeltype>> results;
-        
-        // 分层NSG搜索
-        for(int level = this->maxlevel_; level >= 0; --level) {
-            // 获取当前层入口点
-            unsigned ep = entry_points_[level];
-            
-            // 执行NSG风格搜索
-            std::vector<unsigned> candidates = 
-                nsg_search_layer(query_data, ep, level, k);
-            
-            // 合并结果
-            for(auto& cand : candidates) {
-                float dist = this->fstdistfunc_(
-                    query_data, 
-                    this->getDataByInternalId(cand),
-                    this->dist_func_param_);
-                results.emplace(dist, this->getExternalLabel(cand));
+    searchKnn(const void* query, size_t k, BaseFilterFunctor* filter) const override {
+        // Phase 1: HNSW上层搜索（L1及以上层）
+        std::priority_queue<std::pair<dist_t, labeltype >> result;
+        if (hnsw_.cur_element_count == 0) return result;
+
+        tableint currObj = hnsw_.enterpoint_node_;
+        dist_t curdist = hnsw_.fstdistfunc_(query, hnsw_.getDataByInternalId(hnsw_.enterpoint_node_), hnsw_.dist_func_param_);
+
+        for (int level = hnsw_.maxlevel_; level > 0; level--) {
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                unsigned int *data;
+
+                data = (unsigned int *) hnsw_.get_linklist(currObj, level);
+                int size = hnsw_.getListCount(data);
+                hnsw_.metric_hops++;
+                hnsw_.metric_distance_computations+=size;
+
+                tableint *datal = (tableint *) (data + 1);
+                for (int i = 0; i < size; i++) {
+                    tableint cand = datal[i];
+                    if (cand < 0 || cand > hnsw_.max_elements_)
+                        throw std::runtime_error("cand error");
+                    dist_t d = hnsw_.fstdistfunc_(query, hnsw_.getDataByInternalId(cand), hnsw_.dist_func_param_);
+
+                    if (d < curdist) {
+                        curdist = d;
+                        currObj = cand;
+                        changed = true;
+                    }
+                }
             }
         }
-        return results;
+
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
+
+        top_candidates = searchHybridLayer(currObj, query, k, filter);
+
+        while (top_candidates.size() > k) {
+            top_candidates.pop();
+        }
+        while (top_candidates.size() > 0) {
+            std::pair<dist_t, tableint> rez = top_candidates.top();
+            result.push(std::pair<dist_t, labeltype>(rez.first, hnsw_.getExternalLabel(rez.second)));
+            top_candidates.pop();
+        }
+        return result;
     }
 
-    // NSG分层搜索
-    std::vector<unsigned> nsg_search_layer(const void* query, 
-                                          unsigned entry_point,
-                                          int level,
-                                          size_t k) const {
-        std::vector<unsigned> results;
-        const CompactGraph& layer = layers_[level];
-        
-        // 实现NSG搜索逻辑
-        unsigned visited_cnt = 0;
-        std::priority_queue<Neighbor> candidate_set;
-        boost::dynamic_bitset<> visited(this->max_elements_);
-        
-        candidate_set.emplace(entry_point, 
-            this->fstdistfunc_(query, 
-                this->getDataByInternalId(entry_point),
-                this->dist_func_param_));
+    void saveIndex(const std::string& location) override {
+        // 保存HNSW索引
+        hnsw_.saveIndex(location + "_hnsw.bin");
 
-        while(!candidate_set.empty() && visited_cnt++ < nsg_params_.Get<unsigned>("L_search")) {
-            auto curr = candidate_set.top();
-            candidate_set.pop();
-
-            if(visited[curr.id]) continue;
-            visited.set(curr.id);
-            results.push_back(curr.id);
-
-            for(unsigned neighbor : layer[curr.id]) {
-                float dist = this->fstdistfunc_(
-                    query, 
-                    this->getDataByInternalId(neighbor),
-                    this->dist_func_param_);
-                candidate_set.emplace(neighbor, dist);
-            }
-        }
-        return results;
-    }
-
-    // 重写构建逻辑
-    void BuildHierarchy() {
-        // 初始化多层NSG结构
-        for(int level = 0; level <= this->maxlevel_; ++level) {
-            // 构建每层NSG图
-            CompactGraph layer_graph;
-            build_nsg_layer(level, layer_graph);
-            layers_.push_back(layer_graph);
-            
-            // 确定入口点
-            entry_points_[level] = find_layer_entry_point(level);
-        }
-    }
-
-    void build_nsg_layer(int level, CompactGraph& graph) {
-        // 实现NSG分层构建逻辑
-        unsigned range = nsg_params_.Get<unsigned>("R");
-        graph.resize(this->max_elements_);
-        
-        #pragma omp parallel for
-        for(size_t i = 0; i < this->cur_element_count; ++i) {
-            // 获取分层数据
-            const void* data_point = this->getDataByInternalId(i);
-            
-            // NSG图构建流程
-            std::vector<Neighbor> pool;
-            boost::dynamic_bitset<> flags(this->max_elements_);
-            
-            // 生成候选集
-            this->get_nsg_neighbors(data_point, level, flags, pool);
-            
-            // 剪枝优化
-            sync_prune_nsg(i, pool, flags, graph.data());
-        }
+        // 保存NSG索引
+        nsg_.Save((location + "_nsg.bin").c_str());
     }
 };
-
-// NSG参数初始化
-Parameters InitializeNSGParams() {
-    Parameters params;
-    params.Set<unsigned>("L", 200);   // 搜索深度
-    params.Set<unsigned>("R", 50);    // 邻居数
-    params.Set<unsigned>("C", 500);   // 候选数
-    params.Set<unsigned>("L_search", 50); // 搜索迭代次数
-    return params;
-}
-
 } // namespace hnsw_nsg

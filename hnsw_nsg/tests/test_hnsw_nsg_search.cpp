@@ -7,11 +7,12 @@
 #include <string>
 #include <cmath>
 
-#include "../../hnswlib/hnswlib.h"
+#include "index_hnsw_nsg.h"  // 包含混合索引头文件
 
 using namespace std;
-using namespace hnswlib;
+using namespace hnsw_nsg;
 
+// [保留原有StopW、内存统计函数、get_gt、test_approx、test_vs_recall、load_data等工具函数]
 class StopW {
     std::chrono::steady_clock::time_point time_begin;
  public:
@@ -162,19 +163,15 @@ static void get_gt(
 }
 
 
-static float test_approx(
-    float *massQ,  // 修改为float*
-    size_t vecsize,
-    size_t qsize,
-    HierarchicalNSW<float> &appr_alg, // 修改为float
-    size_t vecdim,
-    vector<std::priority_queue<std::pair<float, labeltype>>> &answers, // 修改为float
-    size_t k) {
+// 修改后的 test_approx 函数（适配 HNSW_NSG）
+static float test_approx(float *massQ, size_t vecsize, size_t qsize, HNSW_NSG<float> &hybrid_alg, // 修改为混合索引类型
+    size_t vecdim, vector<std::priority_queue<std::pair<float, labeltype>>> &answers, size_t k) {
     
     size_t correct = 0;
     size_t total = 0;
-    for (int i = 0; i < qsize; i++) {
-        auto result = appr_alg.searchKnn(massQ + vecdim * i, k);
+    for (size_t i = 0; i < qsize; i++) {
+        // 调用混合索引的搜索接口
+        auto result = hybrid_alg.searchKnn(massQ + vecdim * i, k, nullptr);
         auto gt = answers[i];
         unordered_set<labeltype> g;
         total += gt.size();
@@ -185,10 +182,10 @@ static float test_approx(
         }
 
         while (!result.empty()) {
-            std::cout << "dist: " << result.top().first << "\tlabel: " << result.top().second << "\n";
+            // std::cout << "dist: " << result.top().first << "\tlabel: " << result.top().second << "\n";
             if (g.find(result.top().second) != g.end()) {
                 correct++;
-                std::cout << "correct\n";
+                // std::cout << "correct\n";
             }
             result.pop();
         }
@@ -196,13 +193,55 @@ static float test_approx(
     return 1.0f * correct / total;
 }
 
+float calculateRecall(const std::vector<std::vector<unsigned>>& result, const std::vector<std::vector<unsigned>>& groundtruth) {
+    size_t correct = 0;
+    size_t total = 0;
+
+    for (size_t i = 0; i < result.size(); ++i) {
+        std::unordered_set<unsigned> gt_set(groundtruth[i].begin(), groundtruth[i].end());
+        total += gt_set.size();
+
+        for (unsigned id : result[i]) {
+            if (gt_set.find(id) != gt_set.end()) {
+                correct++;
+            }
+        }
+    }
+
+    return 1.0f * correct / total;
+}
+
+std::vector<std::vector<unsigned>> loadBinaryFile(const char* filename) {
+    std::ifstream in(filename, std::ios::binary | std::ios::in);
+    if (!in) {
+        throw std::runtime_error("Cannot open file: " + std::string(filename));
+    }
+
+    std::vector<std::vector<unsigned>> results;
+    while (in) {
+        unsigned GK;
+        in.read((char*)&GK, sizeof(unsigned));
+        if (!in) break;
+
+        std::vector<unsigned> result(GK);
+        in.read((char*)result.data(), GK * sizeof(unsigned));
+        if (!in) break;
+
+        results.push_back(result);
+    }
+
+    in.close();
+    return results;
+}
+
+// 修改后的 test_vs_recall 函数（适配 HNSW_NSG）
 static void test_vs_recall(
-    float *massQ,  // 修改为float*
+    float *massQ,
     size_t vecsize,
     size_t qsize,
-    HierarchicalNSW<float> &appr_alg, // 修改为float
+    HNSW_NSG<float> &hybrid_alg, // 修改为混合索引类型
     size_t vecdim,
-    vector<std::priority_queue<std::pair<float, labeltype>>> &answers, // 修改为float
+    vector<std::priority_queue<std::pair<float, labeltype>>> &answers,
     size_t k) {
     
     vector<size_t> efs;
@@ -211,17 +250,17 @@ static void test_vs_recall(
     for (int i = 100; i < 500; i += 40) efs.push_back(i);
 
     auto total_time = 0.0f;
-    cout << "EF\tRecall\tTime(us)" << endl;  // 新增表头
+    cout << "EF\tRecall\tTime(us)" << endl;
     for (size_t ef : efs) {
-        appr_alg.setEf(ef);
+        // 设置 HNSW 的 ef 参数（需在 HNSW_NSG 类中添加对应方法）
+        hybrid_alg.setEf(ef);
         StopW stopw;
-        float recall = test_approx(massQ, vecsize, qsize, appr_alg, vecdim, answers, k);
+        float recall = test_approx(massQ, vecsize, qsize, hybrid_alg, vecdim, answers, k);
         float time_us_per_query = stopw.getElapsedTimeMicro() / qsize;
         cout << ef << "\t" << recall << "\t" << time_us_per_query << " us\n";
-        total_time += stopw.getElapsedTimeMicro();  // 累加总时间
+        total_time += stopw.getElapsedTimeMicro();
         if (recall > 1.0) break;
     }
-    // 输出总时间(seconds)
     cout << "Total time for all queries: " << total_time / 1e6 << " seconds" << endl;
 }
 
@@ -257,11 +296,11 @@ void load_data(const char* filename, float*& data, unsigned& num, unsigned& dim)
     in.close();
 }
 
-// [保留原有test_approx和test_vs_recall实现]
 
-void sift_test1M() {
+void sift_test1M(Parameters &params) {
     const int efConstruction = 40;
     const int M = 16;
+    const unsigned nsg_width = 20;  // NSG参数
     const size_t vecdim = 128;
 
     // 使用绝对路径！！！
@@ -269,15 +308,13 @@ void sift_test1M() {
     const char *path_data = "/home/cookiecoolkid/Research/Graph-Computation/hnsw-nsg/dataset/sift/sift_base.fvecs";
     const char *path_gt = "/home/cookiecoolkid/Research/Graph-Computation/hnsw-nsg/dataset/sift/sift_groundtruth.ivecs";
     char path_index[128];
-    snprintf(path_index, sizeof(path_index), "sift1M_ef%d_M%d.bin", efConstruction, M);
+    snprintf(path_index, sizeof(path_index), "sift1M_hybrid_ef%d_M%d_nsgw%d.bin", efConstruction, M, nsg_width);
 
-    // 加载基础数据集
+    // 加载数据集（与原始测试相同）
     float* data_load = nullptr;
     unsigned points_num, dim;
     load_data(path_data, data_load, points_num, dim);
     cout << "Loaded " << points_num << " points, dim: " << dim << endl;
-    cout << "Sample data[0][0:3]: " 
-         << data_load[0] << ", " << data_load[1] << ", " << data_load[2] << endl;
 
     // 加载查询集
     float* query_load = nullptr;
@@ -299,28 +336,32 @@ void sift_test1M() {
     }
     gt_input.close();
 
-    // 初始化HNSW索引
+    // 初始化混合索引
     L2Space space(vecdim);
-    HierarchicalNSW<float>* appr_alg = nullptr;
+    HNSW_NSG<float>* hybrid_alg = nullptr;  // 使用混合索引
 
-    chrono::duration<double> build_time{0};  // 新增：构建时间统计变量
+    chrono::duration<double> build_time{0};
 
     if (exists_test(path_index)) {
         cout << "Loading index from: " << path_index << endl;
-        appr_alg = new HierarchicalNSW<float>(&space, path_index);
+        // 注意：需要实现混合索引的加载逻辑
+        // hybrid_alg = new HNSW_NSG<float>(&space, path_index);
+        throw runtime_error("Loading not implemented");
     } else {
-        cout << "Building index..." << endl;
-        auto build_start = chrono::high_resolution_clock::now();  // 记录构建开始时间
+        cout << "Building hybrid index..." << endl;
+        auto build_start = chrono::high_resolution_clock::now();
 
-        appr_alg = new HierarchicalNSW<float>(&space, points_num, M, efConstruction);
+        // 初始化混合索引
+        hybrid_alg = new HNSW_NSG<float>(&space, dim, points_num, data_load, query_load, params, M, efConstruction, nsg_width);
 
-        StopW stopw;  // 用于测量处理时间
-        size_t report_every = 100000;  // 每处理 100,000 个点输出一次信息
+        StopW stopw;
+        size_t report_every = 100000;
 
-        // 添加数据点
+        // 添加数据点（自动处理映射）
         #pragma omp parallel for
         for (size_t i = 0; i < points_num; ++i) {
-            appr_alg->addPoint(data_load + i * vecdim, i);
+            hybrid_alg->addPoint(data_load + i * vecdim, i, false);
+            
             if (i % report_every == 0) {
                 auto elapsed_time = stopw.getElapsedTimeMicro();  // 获取当前处理时间
                 double kips = report_every / (elapsed_time / 1e6);  // 计算 kips
@@ -333,21 +374,58 @@ void sift_test1M() {
             }
         }
 
-        auto build_end = chrono::high_resolution_clock::now();  // 记录构建结束时间
-        build_time = build_end - build_start;  // 计算构建耗时
+        hybrid_alg->Build_NSG(data_load, params);  // 构建NSG图
 
-        appr_alg->saveIndex(path_index);
-        cout << "Index build time: " << build_time.count() << " seconds" << endl;  // 输出构建时间
+        auto build_end = chrono::high_resolution_clock::now();
+        build_time = build_end - build_start;
+        // hybrid_alg->saveIndex(path_index);  // 保存索引
+        cout << "Hybrid index build time: " << build_time.count() << " seconds" << endl;
     }
 
-    // 验证召回率
+    // 验证召回率（使用混合索引搜索）
     vector<std::priority_queue<std::pair<float, labeltype>>> answers;
     get_gt(gt, query_load, nullptr, points_num, query_num, space, vecdim, answers, 100);
-    test_vs_recall(query_load, points_num, query_num, *appr_alg, vecdim, answers, 100);
+    test_vs_recall(query_load, points_num, query_num, *hybrid_alg, vecdim, answers, 100);
+
+    // 内存统计
+    cout << "Peak RSS: " << getPeakRSS() / 1000000 << " MB" << endl;
+
+    std::vector<std::vector<unsigned>> groundtruth = loadBinaryFile(path_gt);
+    calculateRecall(groundtruth, hybrid_alg->res);
+
 
     // 清理资源
     delete[] data_load;
     delete[] query_load;
     delete[] gt;
-    delete appr_alg;
+    delete hybrid_alg;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 9) {
+        std::cout << argv[0] << " nn_graph_path L R C save_graph_file search_L search_K result_path"
+                << std::endl;
+        exit(-1);
+    }
+
+    std::string nn_graph_path(argv[1]);
+    unsigned L = (unsigned)atoi(argv[2]);
+    unsigned R = (unsigned)atoi(argv[3]);
+    unsigned C = (unsigned)atoi(argv[4]);
+    unsigned search_L = (unsigned)atoi(argv[6]);
+    unsigned search_K = (unsigned)atoi(argv[7]);
+
+    Parameters params;
+    params.Set<unsigned>("L", L);
+    params.Set<unsigned>("R", R);
+    params.Set<unsigned>("C", C);
+    params.Set<std::string>("nn_graph_path", nn_graph_path);
+    params.Set<unsigned>("L_search", search_L);
+    params.Set<unsigned>("P_search", search_L);
+    params.Set<unsigned>("K_search", search_K);
+
+    std::string result_path(argv[8]);
+    params.Set<std::string>("result_path", result_path);
+    sift_test1M(params);
+    return 0;
 }

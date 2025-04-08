@@ -1,6 +1,5 @@
 dataset/
 **/build/
-efanna_graph/
 data/
 
 *.o
