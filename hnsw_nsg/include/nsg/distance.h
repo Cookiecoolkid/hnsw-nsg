@@ -11,7 +11,8 @@ namespace hnsw_nsg{
     L2 = 0,
     INNER_PRODUCT = 1,
     FAST_L2 = 2,
-    PQ = 3
+    PQ = 3,
+    L2AVX = 4,
   };
     class Distance {
     public:
@@ -319,6 +320,29 @@ namespace hnsw_nsg{
       result += norm;
       return result;
     }
+  };
+
+  class DistanceL2AVX : public Distance {
+    public:
+        float compare(const float* a, const float* b, unsigned size) const override {
+            float result = 0;
+            size_t qty = size;
+
+            __m256 sum = _mm256_set1_ps(0.0f);
+
+            for (size_t i = 0; i < qty; i += 8) {
+                __m256 va = _mm256_loadu_ps(a + i);
+                __m256 vb = _mm256_loadu_ps(b + i);
+                __m256 diff = _mm256_sub_ps(va, vb);
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+            }
+
+            float res[8];
+            _mm256_storeu_ps(res, sum);
+            result = res[0] + res[1] + res[2] + res[3] + res[4] + res[5] + res[6] + res[7];
+
+            return result;
+        }
   };
 }
 

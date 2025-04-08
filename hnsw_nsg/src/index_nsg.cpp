@@ -708,12 +708,27 @@ void IndexNSG::SearchFromEnterpoint(const float *query, const float *x, size_t K
   boost::dynamic_bitset<> flags{nd_, 0};
 
   unsigned ep = enterpoint_id;
+  flags[ep] = true;
   unsigned tmp_l = 0;
 
   for (; tmp_l < L && tmp_l < final_graph_[ep].size(); tmp_l++) {
     init_ids[tmp_l] = final_graph_[ep][tmp_l];
     flags[init_ids[tmp_l]] = true;
   }
+
+  // TIP? add all init_ids neighbors (enhance the locality) (A little bit speed up)
+  unsigned cur = tmp_l;
+  for (unsigned i = 0; i < cur && tmp_l < L; i++) {
+    unsigned id = init_ids[i];
+    for (; tmp_l < L && tmp_l < final_graph_[id].size(); tmp_l++) {
+      if (flags[final_graph_[id][tmp_l]]) continue;
+      init_ids[tmp_l] = final_graph_[id][tmp_l];
+      flags[init_ids[tmp_l]] = true;
+    }
+  }
+
+
+  // std::cout << "tmp_l:" << tmp_l << std::endl;
 
   while (tmp_l < L) {
     unsigned id = rand() % nd_;
@@ -733,8 +748,8 @@ void IndexNSG::SearchFromEnterpoint(const float *query, const float *x, size_t K
 
   std::sort(retset.begin(), retset.begin() + L);
   int k = 0;
-  while (k < (int)tmp_l) {
-    int nk = tmp_l;
+  while (k < (int)L) {
+    int nk = L;
 
     if (retset[k].flag) {
       retset[k].flag = false;
@@ -746,9 +761,12 @@ void IndexNSG::SearchFromEnterpoint(const float *query, const float *x, size_t K
         flags[id] = 1;
         float dist =
             distance_->compare(query, x + dimension_ * id, (unsigned)dimension_);
-        if (dist >= retset[tmp_l - 1].distance) continue;
+        if (dist >= retset[L - 1].distance) continue;
         Neighbor nn(id, dist, true);
-        int r = InsertIntoPool(retset.data(), tmp_l, nn);
+
+        // std::cout << "query: " << *query << "id:" << id << " dist:" << dist << std::endl;
+
+        int r = InsertIntoPool(retset.data(), L, nn);
 
         if (r < nk) nk = r;
       }
@@ -826,67 +844,5 @@ void IndexNSG::MySearch(const float *query, const float *x, size_t K,
     indices[i] = retset[i].id;
   }
 }
-
-// void IndexNSG::SearchFromEnterpoint(const float *query, const float *x, size_t K, const Parameters &parameters, 
-//                                   unsigned *indices, unsigned enterpoint_id) {
-//   const unsigned L = parameters.Get<unsigned>("L_search");
-//   std::vector<Neighbor> retset(L + 1);
-//   std::vector<unsigned> init_ids(L);
-//   boost::dynamic_bitset<> flags{nd_, 0};
-
-//   data_ = x;
-
-//   // 初始化候选集，从enterpoint_id开始
-//   init_ids[0] = enterpoint_id;
-//   flags[enterpoint_id] = true;
-//   unsigned tmp_l = 1;
-
-//   // 如果需要更多的初始候选点，可以添加其他逻辑
-//   while (tmp_l < L) {
-//     unsigned id = rand() % nd_;
-//     if (flags[id]) continue;
-//     flags[id] = true;
-//     init_ids[tmp_l] = id;
-//     tmp_l++;
-//   }
-
-//   for (unsigned i = 0; i < init_ids.size(); i++) {
-//     unsigned id = init_ids[i];
-//     float dist =
-//         distance_->compare(data_ + dimension_ * id, query, (unsigned)dimension_);
-//     retset[i] = Neighbor(id, dist, true);
-//   }
-
-//   std::sort(retset.begin(), retset.begin() + L);
-//   int k = 0;
-//   while (k < (int)L) {
-//     int nk = L;
-
-//     if (retset[k].flag) {
-//       retset[k].flag = false;
-//       unsigned n = retset[k].id;
-
-//       for (unsigned m = 0; m < final_graph_[n].size(); ++m) {
-//         unsigned id = final_graph_[n][m];
-//         if (flags[id]) continue;
-//         flags[id] = 1;
-//         float dist =
-//             distance_->compare(query, data_ + dimension_ * id, (unsigned)dimension_);
-//         if (dist >= retset[L - 1].distance) continue;
-//         Neighbor nn(id, dist, true);
-//         int r = InsertIntoPool(retset.data(), L, nn);
-
-//         if (r < nk) nk = r;
-//       }
-//     }
-//     if (nk <= k)
-//       k = nk;
-//     else
-//       ++k;
-//   }
-//   for (size_t i = 0; i < K; i++) {
-//     indices[i] = retset[i].id;
-//   }
-// }
 
 }

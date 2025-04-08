@@ -101,6 +101,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         num_deleted_ = 0;
         data_size_ = s->get_data_size();
         fstdistfunc_ = s->get_dist_func();
+
+        // 打印距离计算函数的名称
+        std::cout << "Distance function: " << (void*)fstdistfunc_ << std::endl;
+
         dist_func_param_ = s->get_dist_func_param();
         if ( M <= 10000 ) {
             M_ = M;

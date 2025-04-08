@@ -37,7 +37,7 @@ public:
              const Parameters& parameters, unsigned hnsw_M = 16, size_t hnsw_ef_construction = 200, 
              unsigned nsg_width = 20) 
              : hnsw_(space, max_elements, hnsw_M, hnsw_ef_construction, 100, false), 
-               nsg_(dim,max_elements, L2, nullptr) {
+               nsg_(dim,max_elements, L2AVX, nullptr) {
         data_ = data;
         query_data_ = query_data;
         dim_ = dim;
@@ -47,15 +47,16 @@ public:
 
     HNSW_NSG(SpaceInterface<dist_t>* space, unsigned int dim, size_t max_elements, float* data, float* query_data,
              const Parameters& parameters, std::string hnsw_index_path, std::string nsg_index_path) 
-             : hnsw_(space, hnsw_index_path),
-               nsg_(dim,max_elements, L2, nullptr) {
+             : hnsw_(space, hnsw_index_path, false, max_elements, false),
+               nsg_(dim,max_elements, L2AVX, nullptr) {
         data_ = data;
         query_data_ = query_data;
         dim_ = dim;
         parameters_ = parameters;
         point_num_ = max_elements;
 
-        hnsw_.loadIndex(hnsw_index_path, space, max_elements);
+        // no re-load
+        // hnsw_.loadIndex(hnsw_index_path, space, max_elements);
         nsg_.Load(nsg_index_path.c_str());
     }
 
@@ -90,12 +91,10 @@ public:
     std::vector<unsigned>
     searchHybridLayer(tableint enterpoint, const void* query_data, size_t K, 
                       BaseFilterFunctor* isIdAllowed) {
-        unsigned id = enterpoint;
-
         // 执行NSG搜索
         std::vector<unsigned> indices(K);
         const float *query_float = static_cast<const float*>(query_data);
-        nsg_.SearchFromEnterpoint(query_float, data_ ,K, parameters_, indices.data(), id);
+        nsg_.SearchFromEnterpoint(query_float, data_ ,K, parameters_, indices.data(), enterpoint);
         // nsg_.MySearch(query_float, data_, K, parameters_, indices.data());
 
         res.push_back(indices);
@@ -132,6 +131,9 @@ public:
                     dist_t d = hnsw_.fstdistfunc_(query, hnsw_.getDataByInternalId(cand), hnsw_.dist_func_param_);
 
                     if (d < curdist) {
+                        const float *query_float = static_cast<const float*>(query);
+                        // std::cout << "query: " << *query_float << "level: " << level << " obj: " << cand << " dist: " << d << std::endl;
+
                         curdist = d;
                         currObj = cand;
                         changed = true;

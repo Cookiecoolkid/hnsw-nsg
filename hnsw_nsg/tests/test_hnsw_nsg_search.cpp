@@ -353,7 +353,6 @@ void sift_test1M(Parameters &params) {
     }
 
     // 验证召回率（使用混合索引搜索）
-    vector<std::priority_queue<std::pair<float, labeltype>>> answers;
     std::vector<std::vector<unsigned>> groundtruth = loadBinaryFile(path_gt);
     test_vs_recall(query_load, points_num, query_num, *hybrid_alg, vecdim, groundtruth, 100);
 
