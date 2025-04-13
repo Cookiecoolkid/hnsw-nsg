@@ -144,7 +144,9 @@ public:
 
         // For layer 0
         std::vector<unsigned> top_candidates;
-        top_candidates = searchHybridLayer(currObj, query, std::max(k, hnsw_.ef_), filter);
+        // FIXME: 直接使用 currObj 还是 getExternalLabel(currObj) ?
+        unsigned int id = hnsw_.getExternalLabel(currObj);
+        top_candidates = searchHybridLayer(id, query, std::max(k, hnsw_.ef_), filter);
         return top_candidates;
     }
 
