@@ -9,6 +9,7 @@
 #include <efanna2e/index_random.h>
 #include <efanna2e/util.h>
 #include <filesystem>
+#include <random>
 
 // 加载fvecs文件
 std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsigned& dim) {
@@ -37,8 +38,8 @@ std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsign
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> " << std::endl;
+    if (argc != 4) {
+        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids>" << std::endl;
         return 1;
     }
 
@@ -46,6 +47,7 @@ int main(int argc, char** argv) {
     unsigned num, dim;
     std::vector<float> data = load_fvecs(argv[1], num, dim);
     int n_clusters = atoi(argv[2]);
+    int m = atoi(argv[3]);  // 每个cluster额外选择的点数
 
     // 2. 创建量化器
     faiss::IndexFlatL2* quantizer = new faiss::IndexFlatL2(dim);
@@ -74,16 +76,48 @@ int main(int argc, char** argv) {
     index_ivf->make_direct_map();
 
     // 7. 提取质心并保存
-    std::vector<float> centroids(n_clusters * dim);
-    for (int i = 0; i < n_clusters; i++) {
-        index_ivf->reconstruct(i, centroids.data() + i * dim);
-    }
+    std::vector<float> centroids((n_clusters * (m + 1)) * dim);  // 每个cluster有m+1个点（质心+m个随机点）
+    std::random_device rd;
+    std::mt19937 gen(rd());
 
-    // 保存质心
+    // 保存质心文件头信息
     std::ofstream centroids_file("centroids.fvecs", std::ios::binary);
+    centroids_file.write((char*)&n_clusters, sizeof(n_clusters));
+    centroids_file.write((char*)&m, sizeof(m));
+    centroids_file.write((char*)&dim, sizeof(dim));
+
     for (int i = 0; i < n_clusters; i++) {
+        // 保存质心
+        index_ivf->reconstruct(i, centroids.data() + i * (m + 1) * dim);
         centroids_file.write((char*)&dim, sizeof(dim));
-        centroids_file.write((char*)(centroids.data() + i * dim), dim * sizeof(float));
+        centroids_file.write((char*)(centroids.data() + i * (m + 1) * dim), dim * sizeof(float));
+
+        // 随机选择m个点
+        const auto& ids_in_cluster = cluster_to_ids[i];
+        if (ids_in_cluster.size() > m) {
+            std::vector<size_t> indices(ids_in_cluster.size());
+            std::iota(indices.begin(), indices.end(), 0);
+            std::shuffle(indices.begin(), indices.end(), gen);
+            
+            for (int j = 0; j < m; j++) {
+                size_t idx = indices[j];
+                memcpy(centroids.data() + (i * (m + 1) + j + 1) * dim,
+                       data.data() + ids_in_cluster[idx] * dim,
+                       dim * sizeof(float));
+                centroids_file.write((char*)&dim, sizeof(dim));
+                centroids_file.write((char*)(centroids.data() + (i * (m + 1) + j + 1) * dim), dim * sizeof(float));
+            }
+        } else {
+            // 如果cluster中的点数不足m，则重复使用已有点
+            for (int j = 0; j < m; j++) {
+                size_t idx = j % ids_in_cluster.size();
+                memcpy(centroids.data() + (i * (m + 1) + j + 1) * dim,
+                       data.data() + ids_in_cluster[idx] * dim,
+                       dim * sizeof(float));
+                centroids_file.write((char*)&dim, sizeof(dim));
+                centroids_file.write((char*)(centroids.data() + (i * (m + 1) + j + 1) * dim), dim * sizeof(float));
+            }
+        }
     }
     centroids_file.close();
 

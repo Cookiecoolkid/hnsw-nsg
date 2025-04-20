@@ -38,10 +38,10 @@ int main(int argc, char** argv) {
     // 创建nsg_graph目录
     system("mkdir -p nsg_graph");
 
-    // NSG参数
-    unsigned L = (unsigned)atoi(argv[1]); // 40
-    unsigned R = (unsigned)atoi(argv[2]); // 50
-    unsigned C = (unsigned)atoi(argv[3]); // 默认为 500
+    // NSG参数 
+    unsigned L = (unsigned)atoi(argv[1]); // 40    每个点的候选数
+    unsigned R = (unsigned)atoi(argv[2]); // 50    每个点的最终出边数
+    unsigned C = (unsigned)atoi(argv[3]); // 500   控制邻居连接检查的范围
 
     // 遍历nndescent目录下的所有文件
     DIR* dir;
