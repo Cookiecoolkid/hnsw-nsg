@@ -142,17 +142,25 @@ int main(int argc, char** argv) {
         faiss::IndexNSGFlat* nsg_index = new faiss::IndexNSGFlat(data_dim, 32, faiss::METRIC_L2);
 
         nsg_index->build_type = 1;       // 使用NNDescent构建
-        nsg_index->nndescent_S = 10;     // 图更新时的候选数
-        nsg_index->nndescent_R = 60;     // 邻居扩展数
-        nsg_index->nndescent_L = 100;    // 搜索列表大小
-        nsg_index->GK = 50;              // 构建时的近邻数
+        nsg_index->nndescent_S = 20;     // 增加图更新时的候选数
+        nsg_index->nndescent_R = 100;    // 增加邻居扩展数
+        nsg_index->nndescent_L = 100;    // 增加搜索列表大小
+        nsg_index->GK = 100;             // 增加构建时的近邻数
+
 
         // 提取该 cluster 中的点
-        std::vector<float> cluster_data(ids_in_cluster.size() * data_dim);
+        // TIP HERE: 使用memcpy代替std::copy，提高性能
+        std::vector<float> cluster_data;
+        cluster_data.reserve(ids_in_cluster.size() * data_dim);  // 预分配内存
+        cluster_data.resize(ids_in_cluster.size() * data_dim);   // 确保内存连续
+
+        // 使用memcpy代替std::copy，提高性能
         for (size_t i = 0; i < ids_in_cluster.size(); ++i) {
             faiss::idx_t id = ids_in_cluster[i];
             nsg_ids_to_global_ids[cluster].push_back(id); // 保存点 id 映射
-            std::copy(data.begin() + id * data_dim, data.begin() + (id + 1) * data_dim, cluster_data.begin() + i * data_dim);
+            memcpy(cluster_data.data() + i * data_dim, 
+                   data.data() + id * data_dim, 
+                   data_dim * sizeof(float));
         }
 
         if (!nsg_index->is_trained) {
@@ -187,8 +195,11 @@ int main(int argc, char** argv) {
         std::vector<float> query_distances(k_hnsw);
         std::vector<faiss::idx_t> query_labels(k_hnsw);
 
+        auto start_time_hnsw_search = std::chrono::high_resolution_clock::now();
         index_hnsw->search(1, query.data() + i * query_dim, k_hnsw, query_distances.data(), query_labels.data());
-
+        auto end_time_hnsw_search = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> hnsw_search_time = end_time_hnsw_search - start_time_hnsw_search;
+        std::cout << "Query " << i << ": HNSW Search Time: " << hnsw_search_time.count() << " seconds" << std::endl;
         // 存储所有 NSG 搜索功能的点
         std::priority_queue<std::pair<float, faiss::idx_t>, std::vector<std::pair<float, faiss::idx_t>>, 
                             std::greater<std::pair<float, faiss::idx_t>>> heap;
@@ -196,7 +207,7 @@ int main(int argc, char** argv) {
         // 在 NSG 上搜索得到对应的点
         for (int j = 0; j < k_hnsw; j++) {
             faiss::idx_t centroid_id = query_labels[j];
-            if (centroid_id >= cluster_nsg_indices.size()) {
+            if (centroid_id >= (faiss::idx_t)cluster_nsg_indices.size()) {
                 continue;
             }
             faiss::IndexNSGFlat* nsg_index = cluster_nsg_indices[centroid_id];
@@ -205,7 +216,11 @@ int main(int argc, char** argv) {
             std::vector<float> nsg_distances(k);
             std::vector<faiss::idx_t> nsg_labels(k);
 
+            auto start_time_nsg_search = std::chrono::high_resolution_clock::now();
             nsg_index->search(1, query.data() + i * query_dim, k, nsg_distances.data(), nsg_labels.data());
+            auto end_time_nsg_search = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> nsg_search_time = end_time_nsg_search - start_time_nsg_search;
+            std::cout << "Query " << i << ": NSG Search Time: " << nsg_search_time.count() << " seconds" << std::endl;
 
             // 将结果添加到堆中
             // 这里 label 需要添加 global id 映射
@@ -224,7 +239,7 @@ int main(int argc, char** argv) {
 
         // 计算 recall rate
         std::unordered_set<unsigned> gt_set;
-        int count = 0;
+        // int count = 0;
         for (unsigned id : answers[i]) {
             gt_set.insert(id);
             // std::cout << "count: " << count++ << " id: " << id << std::endl;
