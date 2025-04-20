@@ -31,6 +31,7 @@ add_executable(cluster_IVF_nndescent cluster_IVF_nndescent.cpp)
 add_executable(nndescent_nsg nndescent_nsg.cpp)
 add_executable(cluster_knn_nsg_search cluster_knn_nsg_search.cpp)
 add_executable(cluster_hnsw_nsg_search cluster_hnsw_nsg_search.cpp)
+add_executable(cluster_knn_knn_search cluster_knn_knn_search.cpp)
 
 # 链接库
 target_link_libraries(cluster_IVF_nndescent
@@ -63,6 +64,16 @@ target_link_libraries(cluster_knn_nsg_search
 )
 
 target_link_libraries(cluster_hnsw_nsg_search
+    ${FAISS_LIB}
+    ${OpenBLAS_LIB}
+    ${EFANNA2E_LIB}
+    nsg
+    pthread
+    m
+    ${OpenMP_CXX_FLAGS}
+)
+
+target_link_libraries(cluster_knn_knn_search
     ${FAISS_LIB}
     ${OpenBLAS_LIB}
     ${EFANNA2E_LIB}
