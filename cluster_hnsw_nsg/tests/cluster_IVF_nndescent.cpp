@@ -38,8 +38,8 @@ std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsign
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids>" << std::endl;
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids> <nndescentK> <nndescentL>" << std::endl;
         return 1;
     }
 
@@ -162,9 +162,10 @@ int main(int argc, char** argv) {
         efanna2e::IndexGraph index(dim, ids_in_cluster.size(), efanna2e::L2, (efanna2e::Index*)(&init_index));
 
         efanna2e::Parameters paras;
-        int k_nndescent = 100;
+        int k_nndescent = atoi(argv[4]);
+        int l_nndescent = atoi(argv[5]);
         paras.Set<unsigned>("K", k_nndescent);
-        paras.Set<unsigned>("L", 100);
+        paras.Set<unsigned>("L", l_nndescent);
         paras.Set<unsigned>("iter", 10);
         paras.Set<unsigned>("S", 10);
         paras.Set<unsigned>("R", 100);
