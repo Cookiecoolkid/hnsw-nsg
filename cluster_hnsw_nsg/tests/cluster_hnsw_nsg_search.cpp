@@ -94,21 +94,29 @@ std::vector<float> load_centroids(const std::string& filename, int& n_clusters, 
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe>" << std::endl;
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe> <search_K> <search_L>" << std::endl;
+        std::cerr << "  nprobe: number of clusters to search (default: 100)" << std::endl;
+        std::cerr << "  search_K: number of neighbors to search in NSG (default: 100)" << std::endl;
+        std::cerr << "  search_L: number of candidates in NSG search (default: 100)" << std::endl;
         return 1;
     }
 
-    // 加载查询数据和ground truth
+    // 1. 加载查询数据和ground truth
     unsigned query_num, query_dim;
     std::vector<float> query_data = load_fvecs(argv[1], query_num, query_dim);
     std::vector<std::vector<unsigned>> ground_truth = loadGT(argv[2]);
     int nprobe = atoi(argv[3]); // 表示在质心图上搜索的邻居数（越大，最后搜索的cluster越多，召回率越高）
+    int search_K = atoi(argv[4]); // NSG搜索的邻居数
+    int search_L = atoi(argv[5]); // NSG搜索的候选数
 
     int k = 100; // 最终返回的近邻数
-    int k_per_cluster = k;  // 每个cluster返回的近邻数
 
-    std::cout << "query_num: " << query_num << " query_dim: " << query_dim << " nprobe: " << nprobe << " k: " << k << " k_per_cluster: " << k_per_cluster << std::endl;
+    std::cout << "query_num: " << query_num << " query_dim: " << query_dim 
+              << " nprobe: " << nprobe 
+              << " search_K: " << search_K 
+              << " search_L: " << search_L
+              << " k: " << k << std::endl;
 
     // 加载质心
     int n_clusters, m;
@@ -131,6 +139,7 @@ int main(int argc, char** argv) {
     struct dirent* ent;
     std::regex pattern("nsg_(\\d+)\\.nsg");
 
+
     if ((dir = opendir("nsg_graph")) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
             std::string filename = ent->d_name;
@@ -142,12 +151,16 @@ int main(int argc, char** argv) {
                 std::string cluster_filename = "cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
                 unsigned points_num, dim;
                 std::ifstream in(cluster_filename, std::ios::binary);
+                if (!in.is_open()) {
+                    std::cerr << "Error: Cannot open cluster file " << cluster_filename << std::endl;
+                    continue;
+                }
                 in.read((char*)&dim, 4);
                 in.seekg(0, std::ios::end);
                 size_t fsize = in.tellg();
                 points_num = fsize / ((dim + 1) * 4);
 
-                float* cluster_data = new float[points_num * dim];
+                float* cluster_data = new float[points_num * dim * sizeof(float)];
                 in.seekg(0, std::ios::beg);
                 for (size_t i = 0; i < points_num; i++) {
                     in.seekg(4, std::ios::cur);
@@ -156,24 +169,42 @@ int main(int argc, char** argv) {
                 in.close();
 
                 // 加载ID映射
-                std::string mapping_filename = "nsg_mapping/nsg_mapping_" + std::to_string(cluster_id);
+                std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
                 std::ifstream mapping_file(mapping_filename, std::ios::binary);
+                if (!mapping_file.is_open()) {
+                    std::cerr << "Error: Cannot open mapping file " << mapping_filename << std::endl;
+                    delete[] cluster_data;
+                    continue;
+                }
                 std::vector<faiss::idx_t> id_mapping(points_num);
                 mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
                 mapping_file.close();
 
                 // 创建并加载NSG索引
                 efanna2e::IndexNSG* nsg_index = new efanna2e::IndexNSG(dim, points_num, efanna2e::L2, nullptr);
-                nsg_index->Load(("nsg_graph/" + filename).c_str());
+                std::string nsg_filename = "nsg_graph/" + filename;
+                try {
+                    nsg_index->Load(nsg_filename.c_str());
+                    std::cout << "Successfully loaded NSG from " << nsg_filename << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
+                    delete nsg_index;
+                    delete[] cluster_data;
+                    continue;
+                }
+
                 cluster_nsg_indices[cluster_id] = nsg_index;
                 cluster_data_map[cluster_id] = cluster_data;
                 id_mapping_map[cluster_id] = id_mapping;
             }
         }
         closedir(dir);
+    } else {
+        std::cerr << "Error: Cannot open nsg_graph directory" << std::endl;
+        return 1;
     }
 
-    std::cout << "cluster_nsg_indices.size(): " << cluster_nsg_indices.size() << std::endl;
+    std::cout << "Loaded " << cluster_nsg_indices.size() << " NSG indices" << std::endl;
 
     // 搜索过程
     int correct = 0;
@@ -236,16 +267,16 @@ int main(int argc, char** argv) {
             efanna2e::IndexNSG* nsg_index = cluster_nsg_indices[cluster_id];
             float* cluster_data = cluster_data_map[cluster_id];
             efanna2e::Parameters paras;
-            paras.Set<unsigned>("L_search", k_per_cluster);
-            paras.Set<unsigned>("P_search", k_per_cluster);
-            paras.Set<unsigned>("K_search", k_per_cluster);
+            paras.Set<unsigned>("L_search", search_L);
+            paras.Set<unsigned>("P_search", search_L);
+            paras.Set<unsigned>("K_search", search_K);
 
-            std::vector<unsigned> tmp(k_per_cluster);
+            std::vector<unsigned> tmp(search_K);
             nsg_index->Search(query_data.data() + i * query_dim, 
-                            cluster_data, k_per_cluster, paras, tmp.data());
+                            cluster_data, search_K, paras, tmp.data());
 
             // 将结果添加到map中
-            for (int m = 0; m < k_per_cluster; m++) {
+            for (int m = 0; m < search_K; m++) {
                 unsigned local_id = tmp[m];
                 if (local_id >= id_mapping_map[cluster_id].size()) {
                     std::cerr << "Error: local_id " << local_id << " out of range for cluster " << cluster_id 

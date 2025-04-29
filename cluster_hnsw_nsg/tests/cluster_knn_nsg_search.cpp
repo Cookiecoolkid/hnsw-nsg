@@ -126,33 +126,35 @@ int main(int argc, char** argv) {
     faiss::IndexFlatL2* index_flat = new faiss::IndexFlatL2(query_dim);
     index_flat->add(n_clusters * (m + 1), centroids.data());
 
-    // 4. 加载所有NSG图
+    // 加载所有cluster数据和NSG图
     std::map<int, efanna2e::IndexNSG*> cluster_nsg_indices;
-    std::map<int, float*> cluster_data_map;  // 存储每个cluster的数据
-    std::map<int, std::vector<faiss::idx_t>> id_mapping_map;  // 存储每个cluster的ID映射
+    std::map<int, float*> cluster_data_map;
+    std::map<int, std::vector<faiss::idx_t>> id_mapping_map;
     DIR* dir;
     struct dirent* ent;
-    std::regex pattern("nsg_(\\d+)\\.nsg");
-    std::smatch matches;
+    std::regex pattern("cluster_(\\d+)\\.fvecs");
 
-    if ((dir = opendir("nsg_graph")) != NULL) {
+    if ((dir = opendir("cluster_data")) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
             std::string filename = ent->d_name;
+            std::smatch matches;
             if (std::regex_match(filename, matches, pattern)) {
                 int cluster_id = std::stoi(matches[1]);
                 
-                // 加载对应的cluster数据
-                std::string cluster_filename = "cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
-
+                // 加载cluster数据
+                std::string cluster_filename = "cluster_data/" + filename;
                 unsigned points_num, dim;
                 std::ifstream in(cluster_filename, std::ios::binary);
+                if (!in.is_open()) {
+                    std::cerr << "Error: Cannot open cluster file " << cluster_filename << std::endl;
+                    continue;
+                }
                 in.read((char*)&dim, 4);
                 in.seekg(0, std::ios::end);
-                std::ios::pos_type ss = in.tellg();
-                size_t fsize = (size_t)ss;
-                points_num = (unsigned)(fsize / (dim + 1) / 4);
+                size_t fsize = in.tellg();
+                points_num = fsize / ((dim + 1) * 4);
 
-                float* cluster_data = new float[(size_t)points_num * (size_t)dim];
+                float* cluster_data = new float[points_num * dim * sizeof(float)];
                 in.seekg(0, std::ios::beg);
                 for (size_t i = 0; i < points_num; i++) {
                     in.seekg(4, std::ios::cur);
@@ -161,24 +163,42 @@ int main(int argc, char** argv) {
                 in.close();
 
                 // 加载ID映射
-                std::string mapping_filename = "nsg_mapping/nsg_mapping_" + std::to_string(cluster_id);
+                std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
                 std::ifstream mapping_file(mapping_filename, std::ios::binary);
+                if (!mapping_file.is_open()) {
+                    std::cerr << "Error: Cannot open mapping file " << mapping_filename << std::endl;
+                    delete[] cluster_data;
+                    continue;
+                }
                 std::vector<faiss::idx_t> id_mapping(points_num);
                 mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
                 mapping_file.close();
-                id_mapping_map[cluster_id] = id_mapping;
 
                 // 创建并加载NSG索引
                 efanna2e::IndexNSG* nsg_index = new efanna2e::IndexNSG(dim, points_num, efanna2e::L2, nullptr);
-                nsg_index->Load(("nsg_graph/" + filename).c_str());
+                std::string nsg_filename = "nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
+                try {
+                    nsg_index->Load(nsg_filename.c_str());
+                    std::cout << "Successfully loaded NSG from " << nsg_filename << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
+                    delete nsg_index;
+                    delete[] cluster_data;
+                    continue;
+                }
+
                 cluster_nsg_indices[cluster_id] = nsg_index;
                 cluster_data_map[cluster_id] = cluster_data;
+                id_mapping_map[cluster_id] = id_mapping;
             }
         }
         closedir(dir);
+    } else {
+        std::cerr << "Error: Cannot open cluster_data directory" << std::endl;
+        return 1;
     }
 
-    std::cout << "cluster_nsg_indices.size(): " << cluster_nsg_indices.size() << std::endl;
+    std::cout << "Loaded " << cluster_nsg_indices.size() << " NSG indices" << std::endl;
 
     // 5. 搜索过程
     int correct = 0;

@@ -38,8 +38,13 @@ std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsign
 }
 
 int main(int argc, char** argv) {
-    if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids> <nndescentK> <nndescentL>" << std::endl;
+    if (argc != 9) {
+        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids> <K> <L> <iter> <S> <R>" << std::endl;
+        std::cerr << "  K: number of neighbors in NNDescent graph (default: 100)" << std::endl;
+        std::cerr << "  L: number of candidates in NNDescent graph (default: 100)" << std::endl;
+        std::cerr << "  iter: number of iterations (default: 10)" << std::endl;
+        std::cerr << "  S: size of candidate set (default: 10)" << std::endl;
+        std::cerr << "  R: maximum degree of each node (default: 100)" << std::endl;
         return 1;
     }
 
@@ -48,6 +53,27 @@ int main(int argc, char** argv) {
     std::vector<float> data = load_fvecs(argv[1], num, dim);
     int n_clusters = atoi(argv[2]);
     int m = atoi(argv[3]);  // 每个cluster额外选择的点数
+
+    // 设置NNDescent参数
+    int k_nndescent = atoi(argv[4]);
+    int l_nndescent = atoi(argv[5]);
+    int iter = atoi(argv[6]);
+    int s = atoi(argv[7]);
+    int r = atoi(argv[8]);
+
+    // 设置默认值
+    if (k_nndescent == -1) k_nndescent = 100;
+    if (l_nndescent == -1) l_nndescent = 100;
+    if (iter == -1) iter = 10;
+    if (s == -1) s = 10;
+    if (r == -1) r = 100;
+
+    std::cout << "NNDescent parameters:" << std::endl
+              << "  K: " << k_nndescent << std::endl
+              << "  L: " << l_nndescent << std::endl
+              << "  iter: " << iter << std::endl
+              << "  S: " << s << std::endl
+              << "  R: " << r << std::endl;
 
     // 2. 创建量化器
     faiss::IndexFlatL2* quantizer = new faiss::IndexFlatL2(dim);
@@ -124,7 +150,7 @@ int main(int argc, char** argv) {
     // 创建目录
     system("mkdir -p cluster_data");
     system("mkdir -p nndescent");
-    system("mkdir -p nsg_mapping");  // 创建映射文件目录
+    system("mkdir -p mapping");  // 创建映射文件目录
 
     // 8. 为每个cluster构建NNDescent图
     for (const auto& pair : cluster_to_ids) {
@@ -132,18 +158,15 @@ int main(int argc, char** argv) {
         const std::vector<faiss::idx_t>& ids_in_cluster = pair.second;
 
         // 保存ID映射
-        std::string mapping_filename = "nsg_mapping/nsg_mapping_" + std::to_string(cluster_id);
+        std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
         std::ofstream mapping_file(mapping_filename, std::ios::binary);
         mapping_file.write((char*)ids_in_cluster.data(), ids_in_cluster.size() * sizeof(faiss::idx_t));
         mapping_file.close();
 
         // 提取cluster数据
-        std::vector<float> cluster_data;
-        cluster_data.reserve(ids_in_cluster.size() * dim);
-        cluster_data.resize(ids_in_cluster.size() * dim);
-
+        float* cluster_data = new float[ids_in_cluster.size() * dim * sizeof(float)];
         for (size_t i = 0; i < ids_in_cluster.size(); ++i) {
-            memcpy(cluster_data.data() + i * dim,
+            memcpy(cluster_data + i * dim,
                    data.data() + ids_in_cluster[i] * dim,
                    dim * sizeof(float));
         }
@@ -153,28 +176,52 @@ int main(int argc, char** argv) {
         std::ofstream cluster_file(cluster_filename, std::ios::binary);
         for (size_t i = 0; i < ids_in_cluster.size(); ++i) {
             cluster_file.write((char*)&dim, sizeof(dim));
-            cluster_file.write((char*)(cluster_data.data() + i * dim), dim * sizeof(float));
+            cluster_file.write((char*)(cluster_data + i * dim), dim * sizeof(float));
         }
         cluster_file.close();
 
         // 构建NNDescent图
+        std::cout << "Building NNDescent graph for cluster " << cluster_id 
+                  << " with " << ids_in_cluster.size() << " points" << std::endl;
+
         efanna2e::IndexRandom init_index(dim, ids_in_cluster.size());
         efanna2e::IndexGraph index(dim, ids_in_cluster.size(), efanna2e::L2, (efanna2e::Index*)(&init_index));
 
         efanna2e::Parameters paras;
-        int k_nndescent = atoi(argv[4]);
-        int l_nndescent = atoi(argv[5]);
         paras.Set<unsigned>("K", k_nndescent);
         paras.Set<unsigned>("L", l_nndescent);
-        paras.Set<unsigned>("iter", 10);
-        paras.Set<unsigned>("S", 10);
-        paras.Set<unsigned>("R", 100);
+        paras.Set<unsigned>("iter", iter);
+        paras.Set<unsigned>("S", s);
+        paras.Set<unsigned>("R", r);
 
-        index.Build(ids_in_cluster.size(), cluster_data.data(), paras);
+        std::cout << "NNDescent parameters for cluster " << cluster_id << ":" << std::endl
+                  << "  K: " << k_nndescent << std::endl
+                  << "  L: " << l_nndescent << std::endl
+                  << "  iter: " << iter << std::endl
+                  << "  S: " << s << std::endl
+                  << "  R: " << r << std::endl;
+
+        try {
+            index.Build(ids_in_cluster.size(), cluster_data, paras);
+            std::cout << "Successfully built NNDescent graph for cluster " << cluster_id << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error building NNDescent graph for cluster " << cluster_id << ": " << e.what() << std::endl;
+            delete[] cluster_data;
+            continue;
+        }
 
         // 保存图
         std::string graph_filename = "nndescent/nndescent_" + std::to_string(cluster_id) + ".graph";
-        index.Save(graph_filename.c_str());
+        try {
+            index.Save(graph_filename.c_str());
+            std::cout << "Successfully saved graph to " << graph_filename << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error saving graph for cluster " << cluster_id << ": " << e.what() << std::endl;
+            delete[] cluster_data;
+            continue;
+        }
+
+        delete[] cluster_data;
     }
 
     // 清理资源

@@ -139,12 +139,16 @@ int main(int argc, char** argv) {
                 std::string cluster_filename = "cluster_data/" + filename;
                 unsigned points_num, dim;
                 std::ifstream in(cluster_filename, std::ios::binary);
+                if (!in.is_open()) {
+                    std::cerr << "Error: Cannot open cluster file " << cluster_filename << std::endl;
+                    continue;
+                }
                 in.read((char*)&dim, 4);
                 in.seekg(0, std::ios::end);
                 size_t fsize = in.tellg();
                 points_num = fsize / ((dim + 1) * 4);
 
-                float* cluster_data = new float[points_num * dim];
+                float* cluster_data = new float[points_num * dim * sizeof(float)];
                 in.seekg(0, std::ios::beg);
                 for (size_t i = 0; i < points_num; i++) {
                     in.seekg(4, std::ios::cur);
@@ -153,8 +157,13 @@ int main(int argc, char** argv) {
                 in.close();
 
                 // 加载ID映射
-                std::string mapping_filename = "nsg_mapping/nsg_mapping_" + std::to_string(cluster_id);
+                std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
                 std::ifstream mapping_file(mapping_filename, std::ios::binary);
+                if (!mapping_file.is_open()) {
+                    std::cerr << "Error: Cannot open mapping file " << mapping_filename << std::endl;
+                    delete[] cluster_data;
+                    continue;
+                }
                 std::vector<faiss::idx_t> id_mapping(points_num);
                 mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
                 mapping_file.close();
@@ -164,7 +173,12 @@ int main(int argc, char** argv) {
             }
         }
         closedir(dir);
+    } else {
+        std::cerr << "Error: Cannot open cluster_data directory" << std::endl;
+        return 1;
     }
+
+    std::cout << "Loaded " << cluster_data_map.size() << " clusters" << std::endl;
 
     // 搜索过程
     int correct = 0;
