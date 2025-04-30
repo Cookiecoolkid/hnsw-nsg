@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
                 std::string nsg_filename = "nsg_graph/" + filename;
                 try {
                     nsg_index->Load(nsg_filename.c_str());
-                    std::cout << "Successfully loaded NSG from " << nsg_filename << std::endl;
+                    // std::cout << "Successfully loaded NSG from " << nsg_filename << std::endl;
                 } catch (const std::exception& e) {
                     std::cerr << "Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
                     delete nsg_index;

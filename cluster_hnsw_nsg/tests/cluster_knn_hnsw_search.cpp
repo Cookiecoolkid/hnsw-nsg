@@ -125,9 +125,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 创建HNSW图索引
-    faiss::IndexHNSWFlat* index_hnsw = new faiss::IndexHNSWFlat(query_dim, M, faiss::METRIC_L2);
-    index_hnsw->add(n_clusters * (m + 1), centroids.data());
+    // 创建KNN图索引
+    faiss::IndexFlatL2* index_flat = new faiss::IndexFlatL2(query_dim);
+    index_flat->add(n_clusters * (m + 1), centroids.data());
 
     // 加载所有cluster数据
     std::map<int, float*> cluster_data_map;
@@ -199,12 +199,12 @@ int main(int argc, char** argv) {
     int total = 0;
     auto start_time_search = std::chrono::high_resolution_clock::now();
 
-    #pragma omp parallel for  
+    #pragma omp parallel for
     for (size_t i = 0; i < query_num; i++) {
-        // 在HNSW图上搜索得到nprobe个点
+        // 在KNN图上搜索得到nprobe个点
         std::vector<float> query_distances(nprobe);
         std::vector<faiss::idx_t> query_labels(nprobe);
-        index_hnsw->search(1, query_data.data() + i * query_dim, nprobe, 
+        index_flat->search(1, query_data.data() + i * query_dim, nprobe, 
                           query_distances.data(), query_labels.data());
 
         // 获取不同的cluster ID
@@ -215,32 +215,8 @@ int main(int argc, char** argv) {
             selected_clusters.insert(cluster_id);
         }
 
-        // // 输出选中的cluster ID
-        // std::cout << "Query " << i << " selected cluster ids: ";
-        // for (auto cluster_id : selected_clusters) {
-        //     std::cout << cluster_id << " ";
-        // }
-        // std::cout << std::endl;
-
-        // // 输出ground truth
-        // std::cout << "Query " << i << " ground truth: ";
-        // for (auto gt : ground_truth[i]) {
-        //     std::cout << gt << " ";
-        // }
-        // std::cout << std::endl;
-
         // 检查ground truth分布在哪些cluster
         std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
-        // std::cout << "Ground truth distribution in clusters:" << std::endl;
-        // for (auto& [cluster_id, mapping] : id_mapping_map) {
-        //     for (size_t local_id = 0; local_id < mapping.size(); local_id++) {
-        //         unsigned global_id = mapping[local_id];
-        //         if (ground_truth_set.count(global_id)) {
-        //             std::cout << "GT " << global_id << " in cluster " << cluster_id 
-        //                       << " (local_id: " << local_id << ")" << std::endl;
-        //         }
-        //     }
-        // }
 
         // 使用map存储全局ID到距离的映射
         std::unordered_map<unsigned, float> global_id_to_dist;
@@ -300,13 +276,6 @@ int main(int argc, char** argv) {
             final_results.push_back(all_results[m].second);
         }
 
-        // // 输出预测结果
-        // std::cout << "Query " << i << " predicted neighbors: ";
-        // for (auto pred : final_results) {
-        //     std::cout << pred << " ";
-        // }
-        // std::cout << std::endl;
-
         // 计算recall rate
         int query_correct = 0;
         for (unsigned id : final_results) {
@@ -316,10 +285,6 @@ int main(int argc, char** argv) {
             }
         }
         total += ground_truth_set.size();
-        
-        // // 输出每个查询的recall
-        // std::cout << "Query " << i << " recall: " << static_cast<double>(query_correct) / ground_truth_set.size() << std::endl;
-        // std::cout << "----------------------------------------" << std::endl;
     }
 
     auto end_time_search = std::chrono::high_resolution_clock::now();
@@ -329,7 +294,7 @@ int main(int argc, char** argv) {
     std::cout << "Recall Rate: " << static_cast<double>(correct) / total << std::endl;
 
     // 清理资源
-    delete index_hnsw;
+    delete index_flat;
     for (auto& pair : cluster_hnsw_indices) {
         delete pair.second;
     }
