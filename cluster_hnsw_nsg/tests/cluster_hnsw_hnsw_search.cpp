@@ -207,12 +207,12 @@ int main(int argc, char** argv) {
         index_hnsw->search(1, query_data.data() + i * query_dim, nprobe, 
                           query_distances.data(), query_labels.data());
 
-        // 获取不同的cluster ID
-        std::unordered_set<faiss::idx_t> selected_clusters;
+        // 统计每个cluster包含的样本点数量
+        std::map<faiss::idx_t, int> cluster_sample_count;
         for (int j = 0; j < nprobe; ++j) {
             faiss::idx_t point_id = query_labels[j];
             faiss::idx_t cluster_id = point_id / (m + 1);
-            selected_clusters.insert(cluster_id);
+            cluster_sample_count[cluster_id]++;
         }
 
         // // 输出选中的cluster ID
@@ -228,7 +228,13 @@ int main(int argc, char** argv) {
         //     std::cout << gt << " ";
         // }
         // std::cout << std::endl;
-
+        // 将cluster按样本点数量排序
+        std::vector<std::pair<faiss::idx_t, int>> sorted_clusters;
+        for (const auto& pair : cluster_sample_count) {
+            sorted_clusters.push_back(pair);
+        }
+        std::sort(sorted_clusters.begin(), sorted_clusters.end(),
+                 [](const auto& a, const auto& b) { return a.second > b.second; });
         // 检查ground truth分布在哪些cluster
         std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
         // std::cout << "Ground truth distribution in clusters:" << std::endl;
@@ -244,9 +250,10 @@ int main(int argc, char** argv) {
 
         // 使用map存储全局ID到距离的映射
         std::unordered_map<unsigned, float> global_id_to_dist;
+        float current_min_max_dist = std::numeric_limits<float>::max();
 
         // 在HNSW上搜索得到对应的点
-        for (auto cluster_id : selected_clusters) {
+        for (const auto& [cluster_id, sample_count] : sorted_clusters) {
             if (cluster_hnsw_indices.find(cluster_id) == cluster_hnsw_indices.end()) {
                 std::cout << "Warning: cluster " << cluster_id << " not found in HNSW indices" << std::endl;
                 continue;
@@ -262,7 +269,8 @@ int main(int argc, char** argv) {
             cluster_index->search(1, query_data.data() + i * query_dim, search_K,
                                 cluster_distances.data(), cluster_labels.data());
 
-            // 将结果添加到map中
+            // 计算当前cluster中最小距离
+            float cluster_min_dist = std::numeric_limits<float>::max();
             for (int m = 0; m < search_K; m++) {
                 unsigned local_id = cluster_labels[m];
                 if (local_id >= id_mapping.size()) {
@@ -272,6 +280,7 @@ int main(int argc, char** argv) {
                 }
                 unsigned global_id = id_mapping[local_id];
                 float dist = cluster_distances[m];
+                cluster_min_dist = std::min(cluster_min_dist, dist);
 
                 // 更新或添加距离
                 if (global_id_to_dist.count(global_id)) {
@@ -279,6 +288,22 @@ int main(int argc, char** argv) {
                 } else {
                     global_id_to_dist[global_id] = dist;
                 }
+            }
+
+            // 如果当前cluster的最小距离大于等于之前所有cluster中最大距离的最小值，则停止搜索
+            if (cluster_min_dist >= current_min_max_dist) {
+                break;
+            }
+
+            // 更新当前最小最大距离
+            if (!global_id_to_dist.empty()) {
+                std::vector<float> distances;
+                distances.reserve(global_id_to_dist.size());
+                for (const auto& pair : global_id_to_dist) {
+                    distances.push_back(pair.second);
+                }
+                std::sort(distances.begin(), distances.end());
+                current_min_max_dist = std::min(current_min_max_dist, distances[std::min(k - 1, (int)distances.size() - 1)]);
             }
         }
 

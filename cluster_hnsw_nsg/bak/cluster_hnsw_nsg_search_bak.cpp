@@ -1,5 +1,7 @@
 #include <faiss/IndexHNSW.h>
 #include <faiss/IndexFlat.h>
+#include <index_nsg.h>
+#include <util.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -93,10 +95,10 @@ std::vector<float> load_centroids(const std::string& filename, int& n_clusters, 
 
 int main(int argc, char** argv) {
     if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe> <search_K> <M>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe> <search_K> <search_L>" << std::endl;
         std::cerr << "  nprobe: number of clusters to search (default: 100)" << std::endl;
-        std::cerr << "  search_K: number of neighbors to search in HNSW (default: 100)" << std::endl;
-        std::cerr << "  M: number of neighbors in HNSW graph (default: 32)" << std::endl;
+        std::cerr << "  search_K: number of neighbors to search in NSG (default: 100)" << std::endl;
+        std::cerr << "  search_L: number of candidates in NSG search (default: 100)" << std::endl;
         return 1;
     }
 
@@ -105,15 +107,15 @@ int main(int argc, char** argv) {
     std::vector<float> query_data = load_fvecs(argv[1], query_num, query_dim);
     std::vector<std::vector<unsigned>> ground_truth = loadGT(argv[2]);
     int nprobe = atoi(argv[3]); // 表示在质心图上搜索的邻居数（越大，最后搜索的cluster越多，召回率越高）
-    int search_K = atoi(argv[4]); // HNSW搜索的邻居数
-    int M = atoi(argv[5]); // HNSW图的邻居数
+    int search_K = atoi(argv[4]); // NSG搜索的邻居数
+    int search_L = atoi(argv[5]); // NSG搜索的候选数
 
     int k = 100; // 最终返回的近邻数
 
     std::cout << "query_num: " << query_num << " query_dim: " << query_dim 
               << " nprobe: " << nprobe 
               << " search_K: " << search_K 
-              << " M: " << M 
+              << " search_L: " << search_L
               << " k: " << k << std::endl;
 
     // 加载质心
@@ -125,19 +127,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 创建KNN图索引
-    faiss::IndexFlatL2* index_flat = new faiss::IndexFlatL2(query_dim);
-    index_flat->add(n_clusters * (m + 1), centroids.data());
+    // 创建HNSW图索引
+    faiss::IndexHNSWFlat* index_hnsw = new faiss::IndexHNSWFlat(query_dim, 32, faiss::METRIC_L2);
+    index_hnsw->add(n_clusters * (m + 1), centroids.data());
 
-    // 加载所有cluster数据
+    // 加载所有NSG图
+    std::map<int, efanna2e::IndexNSG*> cluster_nsg_indices;
     std::map<int, float*> cluster_data_map;
     std::map<int, std::vector<faiss::idx_t>> id_mapping_map;
-    std::map<int, faiss::IndexHNSWFlat*> cluster_hnsw_indices;
     DIR* dir;
     struct dirent* ent;
-    std::regex pattern("cluster_(\\d+)\\.fvecs");
+    std::regex pattern("nsg_(\\d+)\\.nsg");
 
-    if ((dir = opendir("cluster_data")) != NULL) {
+
+    if ((dir = opendir("nsg_graph")) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
             std::string filename = ent->d_name;
             std::smatch matches;
@@ -145,7 +148,7 @@ int main(int argc, char** argv) {
                 int cluster_id = std::stoi(matches[1]);
                 
                 // 加载cluster数据
-                std::string cluster_filename = "cluster_data/" + filename;
+                std::string cluster_filename = "cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
                 unsigned points_num, dim;
                 std::ifstream in(cluster_filename, std::ios::binary);
                 if (!in.is_open()) {
@@ -177,22 +180,31 @@ int main(int argc, char** argv) {
                 mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
                 mapping_file.close();
 
-                // 创建HNSW索引
-                faiss::IndexHNSWFlat* cluster_index = new faiss::IndexHNSWFlat(dim, M, faiss::METRIC_L2);
-                cluster_index->add(points_num, cluster_data);
+                // 创建并加载NSG索引
+                efanna2e::IndexNSG* nsg_index = new efanna2e::IndexNSG(dim, points_num, efanna2e::L2, nullptr);
+                std::string nsg_filename = "nsg_graph/" + filename;
+                try {
+                    nsg_index->Load(nsg_filename.c_str());
+                    // std::cout << "Successfully loaded NSG from " << nsg_filename << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
+                    delete nsg_index;
+                    delete[] cluster_data;
+                    continue;
+                }
 
-                cluster_hnsw_indices[cluster_id] = cluster_index;
+                cluster_nsg_indices[cluster_id] = nsg_index;
                 cluster_data_map[cluster_id] = cluster_data;
                 id_mapping_map[cluster_id] = id_mapping;
             }
         }
         closedir(dir);
     } else {
-        std::cerr << "Error: Cannot open cluster_data directory" << std::endl;
+        std::cerr << "Error: Cannot open nsg_graph directory" << std::endl;
         return 1;
     }
 
-    std::cout << "Loaded " << cluster_hnsw_indices.size() << " clusters" << std::endl;
+    std::cout << "Loaded " << cluster_nsg_indices.size() << " NSG indices" << std::endl;
 
     // 搜索过程
     int correct = 0;
@@ -201,10 +213,10 @@ int main(int argc, char** argv) {
 
     #pragma omp parallel for
     for (size_t i = 0; i < query_num; i++) {
-        // 在KNN图上搜索得到nprobe个点
+        // 在HNSW图上搜索得到nprobe个点
         std::vector<float> query_distances(nprobe);
         std::vector<faiss::idx_t> query_labels(nprobe);
-        index_flat->search(1, query_data.data() + i * query_dim, nprobe, 
+        index_hnsw->search(1, query_data.data() + i * query_dim, nprobe, 
                           query_distances.data(), query_labels.data());
 
         // 统计每个cluster包含的样本点数量
@@ -215,6 +227,19 @@ int main(int argc, char** argv) {
             cluster_sample_count[cluster_id]++;
         }
 
+        // // 输出选中的cluster ID
+        // std::cout << "Query " << i << " selected cluster ids: ";
+        // for (auto cluster_id : selected_clusters) {
+        //     std::cout << cluster_id << " ";
+        // }
+        // std::cout << std::endl;
+
+        // // 输出ground truth
+        // std::cout << "Query " << i << " ground truth: ";
+        // for (auto gt : ground_truth[i]) {
+        //     std::cout << gt << " ";
+        // }
+        // std::cout << std::endl;
         // 将cluster按样本点数量排序
         std::vector<std::pair<faiss::idx_t, int>> sorted_clusters;
         for (const auto& pair : cluster_sample_count) {
@@ -225,39 +250,56 @@ int main(int argc, char** argv) {
 
         // 检查ground truth分布在哪些cluster
         std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
+        // std::cout << "Ground truth distribution in clusters:" << std::endl;
+        // for (auto& [cluster_id, mapping] : id_mapping_map) {
+        //     for (size_t local_id = 0; local_id < mapping.size(); local_id++) {
+        //         unsigned global_id = mapping[local_id];
+        //         if (ground_truth_set.count(global_id)) {
+        //             std::cout << "GT " << global_id << " in cluster " << cluster_id 
+        //                       << " (local_id: " << local_id << ")" << std::endl;
+        //         }
+        //     }
+        // }
 
         // 使用map存储全局ID到距离的映射
         std::unordered_map<unsigned, float> global_id_to_dist;
         float current_min_max_dist = std::numeric_limits<float>::max();
 
-        // 在HNSW上搜索得到对应的点
+        // 在NSG上搜索得到对应的点
         for (const auto& [cluster_id, sample_count] : sorted_clusters) {
-            if (cluster_hnsw_indices.find(cluster_id) == cluster_hnsw_indices.end()) {
-                std::cout << "Warning: cluster " << cluster_id << " not found in HNSW indices" << std::endl;
+            if (cluster_nsg_indices.find(cluster_id) == cluster_nsg_indices.end()) {
+                std::cout << "Warning: cluster " << cluster_id << " not found in NSG indices" << std::endl;
                 continue;
             }
 
-            faiss::IndexHNSWFlat* cluster_index = cluster_hnsw_indices[cluster_id];
+            efanna2e::IndexNSG* nsg_index = cluster_nsg_indices[cluster_id];
             float* cluster_data = cluster_data_map[cluster_id];
-            const auto& id_mapping = id_mapping_map[cluster_id];
+            efanna2e::Parameters paras;
+            paras.Set<unsigned>("L_search", search_L);
+            paras.Set<unsigned>("P_search", search_L);
+            paras.Set<unsigned>("K_search", search_K);
 
-            // 搜索
-            std::vector<float> cluster_distances(search_K);
-            std::vector<faiss::idx_t> cluster_labels(search_K);
-            cluster_index->search(1, query_data.data() + i * query_dim, search_K,
-                                cluster_distances.data(), cluster_labels.data());
+            std::vector<unsigned> tmp(search_K);
+            nsg_index->Search(query_data.data() + i * query_dim, 
+                            cluster_data, search_K, paras, tmp.data());
 
             // 计算当前cluster中最小距离
             float cluster_min_dist = std::numeric_limits<float>::max();
             for (int m = 0; m < search_K; m++) {
-                unsigned local_id = cluster_labels[m];
-                if (local_id >= id_mapping.size()) {
+                unsigned local_id = tmp[m];
+                if (local_id >= id_mapping_map[cluster_id].size()) {
                     std::cerr << "Error: local_id " << local_id << " out of range for cluster " << cluster_id 
-                              << " (size: " << id_mapping.size() << ")" << std::endl;
+                              << " (size: " << id_mapping_map[cluster_id].size() << ")" << std::endl;
                     continue;
                 }
-                unsigned global_id = id_mapping[local_id];
-                float dist = cluster_distances[m];
+                unsigned global_id = id_mapping_map[cluster_id][local_id];
+                
+                // 计算实际距离
+                float dist = 0;
+                for (int d = 0; d < query_dim; d++) {
+                    float diff = query_data[i * query_dim + d] - cluster_data[local_id * query_dim + d];
+                    dist += diff * diff;
+                }
                 cluster_min_dist = std::min(cluster_min_dist, dist);
 
                 // 更新或添加距离
@@ -303,6 +345,13 @@ int main(int argc, char** argv) {
             final_results.push_back(all_results[m].second);
         }
 
+        // // 输出预测结果
+        // std::cout << "Query " << i << " predicted neighbors: ";
+        // for (auto pred : final_results) {
+        //     std::cout << pred << " ";
+        // }
+        // std::cout << std::endl;
+
         // 计算recall rate
         int query_correct = 0;
         for (unsigned id : final_results) {
@@ -312,6 +361,10 @@ int main(int argc, char** argv) {
             }
         }
         total += ground_truth_set.size();
+        
+        // // 输出每个查询的recall
+        // std::cout << "Query " << i << " recall: " << static_cast<double>(query_correct) / ground_truth_set.size() << std::endl;
+        // std::cout << "----------------------------------------" << std::endl;
     }
 
     auto end_time_search = std::chrono::high_resolution_clock::now();
@@ -321,8 +374,8 @@ int main(int argc, char** argv) {
     std::cout << "Recall Rate: " << static_cast<double>(correct) / total << std::endl;
 
     // 清理资源
-    delete index_flat;
-    for (auto& pair : cluster_hnsw_indices) {
+    delete index_hnsw;
+    for (auto& pair : cluster_nsg_indices) {
         delete pair.second;
     }
     for (auto& pair : cluster_data_map) {

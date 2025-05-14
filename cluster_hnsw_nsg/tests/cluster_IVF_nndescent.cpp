@@ -10,6 +10,8 @@
 #include <efanna2e/util.h>
 #include <filesystem>
 #include <random>
+#include <faiss/IndexHNSW.h>
+#include <faiss/index_io.h>
 
 // 加载fvecs文件
 std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsigned& dim) {
@@ -146,6 +148,13 @@ int main(int argc, char** argv) {
         }
     }
     centroids_file.close();
+
+    // 创建HNSW索引并保存
+    faiss::IndexHNSWFlat* index_hnsw = new faiss::IndexHNSWFlat(dim, 32, faiss::METRIC_L2); // M = 32
+    index_hnsw->add(n_clusters * (m + 1), centroids.data());
+    faiss::write_index(index_hnsw, "hnsw_memory.index");
+    std::cout << "HNSW index for centroids saved to hnsw_memory.index" << std::endl;
+    delete index_hnsw;
 
     // 创建目录
     system("mkdir -p cluster_data");
