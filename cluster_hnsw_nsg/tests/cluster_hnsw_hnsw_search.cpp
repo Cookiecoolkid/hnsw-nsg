@@ -199,6 +199,9 @@ int main(int argc, char** argv) {
     int total = 0;
     auto start_time_search = std::chrono::high_resolution_clock::now();
 
+    // 设置 omp 线程数
+    omp_set_num_threads(8);
+
     #pragma omp parallel for  
     for (size_t i = 0; i < query_num; i++) {
         // 在HNSW图上搜索得到nprobe个点

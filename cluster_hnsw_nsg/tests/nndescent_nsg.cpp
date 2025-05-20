@@ -51,7 +51,11 @@ int main(int argc, char** argv) {
     std::regex pattern("cluster_(\\d+)\\.fvecs");
 
     // 创建nsg_graph目录
-    system("mkdir -p nsg_graph");
+    auto ret = system("mkdir -p nsg_graph");
+    if (ret == -1) {
+        std::cerr << "Error creating directory nsg_graph" << std::endl;
+        return 1;
+    }
 
     if ((dir = opendir("cluster_data")) != NULL) {
         while ((ent = readdir(dir)) != NULL) {

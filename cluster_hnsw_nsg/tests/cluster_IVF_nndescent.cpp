@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
 
         // 随机选择m个点
         const auto& ids_in_cluster = cluster_to_ids[i];
-        if (ids_in_cluster.size() > m) {
+        if ((int)ids_in_cluster.size() > m) {
             std::vector<size_t> indices(ids_in_cluster.size());
             std::iota(indices.begin(), indices.end(), 0);
             std::shuffle(indices.begin(), indices.end(), gen);
@@ -157,9 +157,21 @@ int main(int argc, char** argv) {
     delete index_hnsw;
 
     // 创建目录
-    system("mkdir -p cluster_data");
-    system("mkdir -p nndescent");
-    system("mkdir -p mapping");  // 创建映射文件目录
+    auto ret = system("mkdir -p cluster_data");
+    if (ret == -1) {
+        std::cerr << "Error creating directory: cluster_data" << std::endl;
+        return 1;
+    }
+    ret = system("mkdir -p nndescent");
+    if (ret == -1) {
+        std::cerr << "Error creating directory: nndescent" << std::endl;
+        return 1;
+    }
+    ret = system("mkdir -p mapping");  // 创建映射文件目录
+    if (ret == -1) {
+        std::cerr << "Error creating directory: mapping" << std::endl;
+        return 1;
+    }
 
     // 8. 为每个cluster构建NNDescent图
     for (const auto& pair : cluster_to_ids) {
