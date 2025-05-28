@@ -14,84 +14,8 @@
 #include <dirent.h>
 #include <regex>
 #include <unordered_map>
+#include <aux_util.h>
 
-// 加载fvecs文件
-std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsigned& dim) {
-    std::ifstream in(filename, std::ios::binary);
-    if (!in.is_open()) {
-        std::cerr << "Open file error: " << filename << std::endl;
-        exit(1);
-    }
-    
-    in.read((char*)&dim, 4);
-    
-    in.seekg(0, std::ios::end);
-    size_t fsize = in.tellg();
-    num = fsize / ((dim + 1) * 4);
-    
-    std::vector<float> data(num * dim);
-    
-    in.seekg(0, std::ios::beg);
-    for (size_t i = 0; i < num; ++i) {
-        in.seekg(4, std::ios::cur);
-        in.read((char*)(data.data() + i * dim), dim * sizeof(float));
-    }
-    in.close();
-    
-    return data;
-}
-
-std::vector<std::vector<unsigned>> loadGT(const char* filename) {
-    std::ifstream in(filename, std::ios::binary | std::ios::in);
-    if (!in) {
-        throw std::runtime_error("Cannot open file: " + std::string(filename));
-    }
-
-    std::vector<std::vector<unsigned>> results;
-    while (in) {
-        unsigned GK;
-        in.read((char*)&GK, sizeof(unsigned));
-        if (!in) break;
-
-        std::vector<unsigned> result(GK);
-        in.read((char*)result.data(), GK * sizeof(unsigned));
-        if (!in) break;
-
-        results.push_back(result);
-    }
-
-    in.close();
-    return results;
-}
-
-// 加载质心
-std::vector<float> load_centroids(const std::string& filename, int& n_clusters, int& m, unsigned& dim) {
-    std::ifstream in(filename, std::ios::binary);
-    if (!in.is_open()) {
-        std::cerr << "Open file error: " << filename << std::endl;
-        exit(1);
-    }
-    
-    in.read((char*)&n_clusters, sizeof(n_clusters));
-    in.read((char*)&m, sizeof(m));
-    in.read((char*)&dim, sizeof(dim));
-    
-    size_t total_points = n_clusters * (m + 1);
-    std::vector<float> centroids(total_points * dim);
-    
-    for (size_t i = 0; i < total_points; ++i) {
-        unsigned point_dim;
-        in.read((char*)&point_dim, sizeof(point_dim));
-        if (point_dim != dim) {
-            std::cerr << "Dimension mismatch in centroids file" << std::endl;
-            exit(1);
-        }
-        in.read((char*)(centroids.data() + i * dim), dim * sizeof(float));
-    }
-    
-    in.close();
-    return centroids;
-}
 
 int main(int argc, char** argv) {
     if (argc != 6) {
@@ -104,8 +28,8 @@ int main(int argc, char** argv) {
 
     // 1. 加载查询数据和ground truth
     unsigned query_num, query_dim;
-    std::vector<float> query_data = load_fvecs(argv[1], query_num, query_dim);
-    std::vector<std::vector<unsigned>> ground_truth = loadGT(argv[2]);
+    std::vector<float> query_data = CNNS::load_fvecs(argv[1], query_num, query_dim);
+    std::vector<std::vector<unsigned>> ground_truth = CNNS::loadGT(argv[2]);
     int nprobe = atoi(argv[3]); // 表示在质心图上搜索的邻居数（越大，最后搜索的cluster越多，召回率越高）
     int search_K = atoi(argv[4]); // NSG搜索的邻居数
     int search_L = atoi(argv[5]); // NSG搜索的候选数
@@ -121,7 +45,7 @@ int main(int argc, char** argv) {
     // 加载质心
     int n_clusters, m;
     unsigned centroids_dim;
-    std::vector<float> centroids = load_centroids("centroids.fvecs", n_clusters, m, centroids_dim);
+    std::vector<float> centroids = CNNS::load_centroids("centroids.fvecs", n_clusters, m, centroids_dim);
     if (centroids_dim != query_dim) {
         std::cerr << "Dimension mismatch between data and centroids" << std::endl;
         return 1;

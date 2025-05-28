@@ -64,29 +64,6 @@ include_directories(
     ${OpenBLAS_INCLUDE_DIRS}
 )
 
-# # 添加测试程序
-# add_executable(cluster_IVF_nndescent tests/cluster_IVF_nndescent.cpp)
-# add_executable(nndescent_nsg tests/nndescent_nsg.cpp)
-# add_executable(cluster_nsg_search tests/cluster_nsg_search.cpp)
-
-# # 链接库
-# target_link_libraries(cluster_IVF_nndescent
-#     ${FAISS_LIBRARIES}
-#     ${OpenBLAS_LIBRARIES}
-#     OpenMP::OpenMP_CXX
-# )
-
-# target_link_libraries(nndescent_nsg
-#     ${OpenBLAS_LIBRARIES}
-#     OpenMP::OpenMP_CXX
-# )
-
-# target_link_libraries(cluster_nsg_search
-#     ${FAISS_LIBRARIES}
-#     ${OpenBLAS_LIBRARIES}
-#     OpenMP::OpenMP_CXX
-# )
-
 # 设置编译选项
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
 

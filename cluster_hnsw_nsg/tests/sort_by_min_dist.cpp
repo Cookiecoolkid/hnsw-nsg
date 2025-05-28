@@ -16,7 +16,84 @@
 #include <regex>
 #include <unordered_map>
 #include <omp.h>
-#include <aux_util.h>
+
+// 加载fvecs文件
+std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsigned& dim) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Open file error: " << filename << std::endl;
+        exit(1);
+    }
+    
+    in.read((char*)&dim, 4);
+    
+    in.seekg(0, std::ios::end);
+    size_t fsize = in.tellg();
+    num = fsize / ((dim + 1) * 4);
+    
+    std::vector<float> data(num * dim);
+    
+    in.seekg(0, std::ios::beg);
+    for (size_t i = 0; i < num; ++i) {
+        in.seekg(4, std::ios::cur);
+        in.read((char*)(data.data() + i * dim), dim * sizeof(float));
+    }
+    in.close();
+    
+    return data;
+}
+
+std::vector<std::vector<unsigned>> loadGT(const char* filename) {
+    std::ifstream in(filename, std::ios::binary | std::ios::in);
+    if (!in) {
+        throw std::runtime_error("Cannot open file: " + std::string(filename));
+    }
+
+    std::vector<std::vector<unsigned>> results;
+    while (in) {
+        unsigned GK;
+        in.read((char*)&GK, sizeof(unsigned));
+        if (!in) break;
+
+        std::vector<unsigned> result(GK);
+        in.read((char*)result.data(), GK * sizeof(unsigned));
+        if (!in) break;
+
+        results.push_back(result);
+    }
+
+    in.close();
+    return results;
+}
+
+// 加载质心
+std::vector<float> load_centroids(const std::string& filename, int& n_clusters, int& m, unsigned& dim) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        std::cerr << "Open file error: " << filename << std::endl;
+        exit(1);
+    }
+    
+    in.read((char*)&n_clusters, sizeof(n_clusters));
+    in.read((char*)&m, sizeof(m));
+    in.read((char*)&dim, sizeof(dim));
+    
+    size_t total_points = n_clusters * (m + 1);
+    std::vector<float> centroids(total_points * dim);
+    
+    for (size_t i = 0; i < total_points; ++i) {
+        unsigned point_dim;
+        in.read((char*)&point_dim, sizeof(point_dim));
+        if (point_dim != dim) {
+            std::cerr << "Dimension mismatch in centroids file" << std::endl;
+            exit(1);
+        }
+        in.read((char*)(centroids.data() + i * dim), dim * sizeof(float));
+    }
+    
+    in.close();
+    return centroids;
+}
 
 // 新函数：按需加载指定cluster的数据和NSG索引
 bool load_cluster_specific_data_and_nsg(
@@ -24,11 +101,16 @@ bool load_cluster_specific_data_and_nsg(
     unsigned global_dim, // 全局维度，用于NSG索引初始化和数据读取
     std::map<int, float*>& cluster_data_map,
     std::map<int, std::vector<faiss::idx_t>>& id_mapping_map,
-    std::map<int, efanna2e::IndexNSG*>& cluster_nsg_indices,
-    const std::string& prefix) {
+    std::map<int, efanna2e::IndexNSG*>& cluster_nsg_indices) {
+
+    // 检查是否已加载 (这部分检查在critical区外进行一次，避免不必要的critical区进入)
+    // if (cluster_nsg_indices.count(cluster_id) && cluster_data_map.count(cluster_id) && id_mapping_map.count(cluster_id)) {
+    //     return true; // 如果所有相关数据都已存在，则认为已加载 (实际场景中，这个检查可能在omp critical内部更安全)
+    // }
+    // 这个函数的核心逻辑将在 omp critical 内部被调用，以确保线程安全地检查和加载。
 
     // 加载cluster数据
-    std::string cluster_filename = prefix + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
+    std::string cluster_filename = "cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
     unsigned points_num, dim_cluster_data; // cluster内点维度应与global_dim一致
     std::ifstream in_cluster_data(cluster_filename, std::ios::binary);
     if (!in_cluster_data.is_open()) {
@@ -66,7 +148,7 @@ bool load_cluster_specific_data_and_nsg(
     in_cluster_data.close();
 
     // 加载ID映射
-    std::string mapping_filename = prefix + "/mapping/mapping_" + std::to_string(cluster_id);
+    std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
     std::ifstream mapping_file(mapping_filename, std::ios::binary);
     if (!mapping_file.is_open()) {
         std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cannot open mapping file " << mapping_filename << std::endl;
@@ -90,7 +172,7 @@ bool load_cluster_specific_data_and_nsg(
         delete[] cluster_data;
         return false;
     }
-    std::string nsg_filename = prefix + "/nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
+    std::string nsg_filename = "nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
     try {
         nsg_index->Load(nsg_filename.c_str());
     } catch (const std::exception& e) {
@@ -105,27 +187,26 @@ bool load_cluster_specific_data_and_nsg(
     id_mapping_map[cluster_id] = id_mapping;
     cluster_nsg_indices[cluster_id] = nsg_index;
     
+    // std::cout << "Thread " << omp_get_thread_num() << ": Successfully loaded data and NSG for cluster " << cluster_id << std::endl;
     return true;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 7) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe> <search_K> <search_L> <prefix>" << std::endl;
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0] << " <path_to_query_data> <path_to_ground_truth> <nprobe> <search_K> <search_L>" << std::endl;
         std::cerr << "  nprobe: number of clusters to search (default: 100)" << std::endl;
         std::cerr << "  search_K: number of neighbors to search in NSG (default: 100)" << std::endl;
         std::cerr << "  search_L: number of candidates in NSG search (default: 100)" << std::endl;
-        std::cerr << "  prefix: directory prefix for all data files" << std::endl;
         return 1;
     }
 
     // 1. 加载查询数据和ground truth
     unsigned query_num, query_dim;
-    std::vector<float> query_data = CNNS::load_fvecs(argv[1], query_num, query_dim);
-    std::vector<std::vector<unsigned>> ground_truth = CNNS::loadGT(argv[2]);
+    std::vector<float> query_data = load_fvecs(argv[1], query_num, query_dim);
+    std::vector<std::vector<unsigned>> ground_truth = loadGT(argv[2]);
     int nprobe = atoi(argv[3]); // 表示在质心图上搜索的邻居数（越大，最后搜索的cluster越多，召回率越高）
     int search_K = atoi(argv[4]); // NSG搜索的邻居数
     int search_L = atoi(argv[5]); // NSG搜索的候选数
-    std::string prefix = argv[6]; // 文件路径前缀
 
     int k = 100; // 最终返回的近邻数
 
@@ -137,19 +218,19 @@ int main(int argc, char** argv) {
     // 加载质心数据
     int n_clusters, m;
     unsigned centroids_dim;
-    std::vector<float> centroids = CNNS::load_centroids(prefix + "/centroids.fvecs", n_clusters, m, centroids_dim);
+    std::vector<float> centroids = load_centroids("centroids.fvecs", n_clusters, m, centroids_dim);
     if (centroids_dim != query_dim) {
         std::cerr << "Dimension mismatch between data and centroids" << std::endl;
         return 1;
     }
 
     // 加载HNSW图索引
-    faiss::IndexHNSWFlat* index_hnsw = dynamic_cast<faiss::IndexHNSWFlat*>(faiss::read_index((prefix + "/hnsw_memory.index").c_str()));
+    faiss::IndexHNSWFlat* index_hnsw = dynamic_cast<faiss::IndexHNSWFlat*>(faiss::read_index("hnsw_memory.index"));
     if (!index_hnsw) {
-        std::cerr << "Error loading HNSW index from " << prefix << "/hnsw_memory.index" << std::endl;
+        std::cerr << "Error loading HNSW index from hnsw_memory.index" << std::endl;
         return 1;
     }
-    std::cout << "HNSW index loaded from " << prefix << "/hnsw_memory.index" << std::endl;
+    std::cout << "HNSW index loaded from hnsw_memory.index" << std::endl;
 
     // 初始化空的map用于存储按需加载的NSG图数据
     std::map<int, efanna2e::IndexNSG*> cluster_nsg_indices;
@@ -172,21 +253,40 @@ int main(int argc, char** argv) {
         index_hnsw->search(1, query_data.data() + i * query_dim, nprobe, 
                           query_distances.data(), query_labels.data());
 
-        // 统计每个cluster包含的样本点数量
-        std::map<faiss::idx_t, int> cluster_sample_count;
+        // 修改排序逻辑，使用样本点到查询点的距离
+        std::map<faiss::idx_t, float> cluster_min_dist; // 记录每个簇中最近样本点到查询点的距离
+        std::map<faiss::idx_t, int> cluster_sample_count; // 保留样本点计数，可能后续会用到
+
         for (int j = 0; j < nprobe; ++j) {
             faiss::idx_t point_id = query_labels[j];
             faiss::idx_t cluster_id = point_id / (m + 1);
             cluster_sample_count[cluster_id]++;
+            
+            // 计算当前样本点到查询点的距离
+            float dist = 0;
+            for (unsigned d = 0; d < query_dim; d++) {
+                float diff = query_data[i * query_dim + d] - centroids[point_id * query_dim + d];
+                dist += diff * diff;
+            }
+            
+            // 更新该簇的最小距离
+            if (cluster_min_dist.count(cluster_id)) {
+                cluster_min_dist[cluster_id] = std::min(cluster_min_dist[cluster_id], dist);
+            } else {
+                cluster_min_dist[cluster_id] = dist;
+            }
         }
 
-        // 将cluster按样本点数量排序
-        std::vector<std::pair<faiss::idx_t, int>> sorted_clusters;
-        for (const auto& pair : cluster_sample_count) {
+        // 将cluster按最小距离排序
+        std::vector<std::pair<faiss::idx_t, float>> sorted_clusters;
+        for (const auto& pair : cluster_min_dist) {
             sorted_clusters.push_back(pair);
         }
         std::sort(sorted_clusters.begin(), sorted_clusters.end(),
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
+                 [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // 使用set记录已搜索过的簇
+        std::unordered_set<faiss::idx_t> searched_clusters;
 
         // 检查ground truth分布在哪些cluster
         std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
@@ -196,29 +296,33 @@ int main(int argc, char** argv) {
         float current_min_max_dist = std::numeric_limits<float>::max();
 
         // 在NSG上搜索得到对应的点
-        for (const auto& [cluster_id_pair, sample_count] : sorted_clusters) {
-            faiss::idx_t cluster_id = cluster_id_pair; // 从pair中获取cluster_id
-
+        for (const auto& [cluster_id, min_dist] : sorted_clusters) {
+            // 如果该簇已经搜索过，跳过
+            if (searched_clusters.count(cluster_id)) {
+                continue;
+            }
+            
+            // 标记该簇为已搜索
+            searched_clusters.insert(cluster_id);
+            
             // 按需加载 cluster 数据和 NSG 索引，需要线程安全保护
             bool is_loaded_or_load_successful = false;
-            if (cluster_nsg_indices.count(cluster_id)) { // 先在不上锁的情况下检查
-                 is_loaded_or_load_successful = true;
+            if (cluster_nsg_indices.count(cluster_id)) {
+                is_loaded_or_load_successful = true;
             } else {
                 #pragma omp critical
                 {
-                    // 双重检查，防止多个线程同时尝试加载同一个cluster
                     if (!cluster_nsg_indices.count(cluster_id)) {
-                        if (load_cluster_specific_data_and_nsg(cluster_id, query_dim, cluster_data_map, id_mapping_map, cluster_nsg_indices, prefix)) {
+                        if (load_cluster_specific_data_and_nsg(cluster_id, query_dim, 
+                            cluster_data_map, id_mapping_map, cluster_nsg_indices)) {
                             is_loaded_or_load_successful = true;
-                        } else {
-                            // std::cerr << "Thread " << omp_get_thread_num() << ": Failed to load cluster " << cluster_id << " on demand." << std::endl;
                         }
-                    } else { // 其他线程已成功加载
+                    } else {
                         is_loaded_or_load_successful = true;
                     }
                 }
             }
-
+            
             if (!is_loaded_or_load_successful) {
                 // 输出警告可以考虑放在 critical 区外，或者只在 load_cluster_specific_data_and_nsg 内部处理
                 // std::cout << "Thread " << omp_get_thread_num() << ": Warning: cluster " << cluster_id << " could not be loaded or found." << std::endl;
@@ -309,6 +413,7 @@ int main(int argc, char** argv) {
             }
         }
         total += ground_truth_set.size();
+        
     }
 
     auto end_time_search = std::chrono::high_resolution_clock::now();

@@ -431,7 +431,7 @@ void IndexNSG::Build(size_t n, const float *data, const Parameters &parameters) 
     max = max < size ? size : max;
     min = min > size ? size : min;
     avg += size;
-    printf("i = %ld, Max = %d, Min = %d, Cur_size = %d\n", i, max, min, size);
+    printf("i = %ld, Max = %d, Min = %d, Cur_size = %ld\n", i, max, min, size);
   }
   avg /= 1.0 * nd_;
   printf("Degree Statistics: Max = %d, Min = %d, Avg = %d\n", max, min, avg);

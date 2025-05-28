@@ -267,7 +267,7 @@ int main(int argc, char** argv) {
                 
                 // 计算实际距离
                 float dist = 0;
-                for (int d = 0; d < query_dim; d++) {
+                for (int d = 0; d < (int)query_dim; d++) {
                     float diff = query_data[i * query_dim + d] - cluster_data[local_id * query_dim + d];
                     dist += diff * diff;
                 }
@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
         // 选择前k个结果
         std::vector<unsigned> final_results;
         final_results.reserve(k);
-        for (int m = 0; m < k && m < all_results.size(); m++) {
+        for (int m = 0; m < k && m < (int)all_results.size(); m++) {
             final_results.push_back(all_results[m].second);
         }
 

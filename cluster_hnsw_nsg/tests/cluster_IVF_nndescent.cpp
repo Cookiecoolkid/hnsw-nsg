@@ -40,13 +40,49 @@ std::vector<float> load_fvecs(const std::string& filename, unsigned& num, unsign
 }
 
 int main(int argc, char** argv) {
-    if (argc != 9) {
-        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids> <K> <L> <iter> <S> <R>" << std::endl;
+    if (argc != 10) {
+        std::cerr << "Usage: " << argv[0] << " <data_file> <n_clusters> <m_centroids> <K> <L> <iter> <S> <R> <prefix>" << std::endl;
         std::cerr << "  K: number of neighbors in NNDescent graph (default: 100)" << std::endl;
         std::cerr << "  L: number of candidates in NNDescent graph (default: 100)" << std::endl;
         std::cerr << "  iter: number of iterations (default: 10)" << std::endl;
         std::cerr << "  S: size of candidate set (default: 10)" << std::endl;
         std::cerr << "  R: maximum degree of each node (default: 100)" << std::endl;
+        std::cerr << "  prefix: prefix directory for output files" << std::endl;
+        return 1;
+    }
+
+    // 获取prefix参数
+    std::string prefix = argv[9];
+
+    // 创建prefix目录
+    std::string mkdir_cmd = "mkdir -p " + prefix;
+    auto ret = system(mkdir_cmd.c_str());
+    if (ret == -1) {
+        std::cerr << "Error creating directory: " << prefix << std::endl;
+        return 1;
+    }
+
+    // 修改所有文件路径，添加prefix
+    std::string centroids_path = prefix + "/centroids.fvecs";
+    std::string hnsw_index_path = prefix + "/hnsw_memory.index";
+    std::string cluster_data_dir = prefix + "/cluster_data";
+    std::string nndescent_dir = prefix + "/nndescent";
+    std::string mapping_dir = prefix + "/mapping";
+
+    // 创建子目录
+    ret = system(("mkdir -p " + cluster_data_dir).c_str());
+    if (ret == -1) {
+        std::cerr << "Error creating directory: " << cluster_data_dir << std::endl;
+        return 1;
+    }
+    ret = system(("mkdir -p " + nndescent_dir).c_str());
+    if (ret == -1) {
+        std::cerr << "Error creating directory: " << nndescent_dir << std::endl;
+        return 1;
+    }
+    ret = system(("mkdir -p " + mapping_dir).c_str());
+    if (ret == -1) {
+        std::cerr << "Error creating directory: " << mapping_dir << std::endl;
         return 1;
     }
 
@@ -109,7 +145,7 @@ int main(int argc, char** argv) {
     std::mt19937 gen(rd());
 
     // 保存质心文件头信息
-    std::ofstream centroids_file("centroids.fvecs", std::ios::binary);
+    std::ofstream centroids_file(centroids_path, std::ios::binary);
     centroids_file.write((char*)&n_clusters, sizeof(n_clusters));
     centroids_file.write((char*)&m, sizeof(m));
     centroids_file.write((char*)&dim, sizeof(dim));
@@ -152,26 +188,9 @@ int main(int argc, char** argv) {
     // 创建HNSW索引并保存
     faiss::IndexHNSWFlat* index_hnsw = new faiss::IndexHNSWFlat(dim, 32, faiss::METRIC_L2); // M = 32
     index_hnsw->add(n_clusters * (m + 1), centroids.data());
-    faiss::write_index(index_hnsw, "hnsw_memory.index");
-    std::cout << "HNSW index for centroids saved to hnsw_memory.index" << std::endl;
+    faiss::write_index(index_hnsw, hnsw_index_path.c_str());
+    std::cout << "HNSW index for centroids saved to " << hnsw_index_path << std::endl;
     delete index_hnsw;
-
-    // 创建目录
-    auto ret = system("mkdir -p cluster_data");
-    if (ret == -1) {
-        std::cerr << "Error creating directory: cluster_data" << std::endl;
-        return 1;
-    }
-    ret = system("mkdir -p nndescent");
-    if (ret == -1) {
-        std::cerr << "Error creating directory: nndescent" << std::endl;
-        return 1;
-    }
-    ret = system("mkdir -p mapping");  // 创建映射文件目录
-    if (ret == -1) {
-        std::cerr << "Error creating directory: mapping" << std::endl;
-        return 1;
-    }
 
     // 8. 为每个cluster构建NNDescent图
     for (const auto& pair : cluster_to_ids) {
@@ -179,7 +198,7 @@ int main(int argc, char** argv) {
         const std::vector<faiss::idx_t>& ids_in_cluster = pair.second;
 
         // 保存ID映射
-        std::string mapping_filename = "mapping/mapping_" + std::to_string(cluster_id);
+        std::string mapping_filename = mapping_dir + "/mapping_" + std::to_string(cluster_id);
         std::ofstream mapping_file(mapping_filename, std::ios::binary);
         mapping_file.write((char*)ids_in_cluster.data(), ids_in_cluster.size() * sizeof(faiss::idx_t));
         mapping_file.close();
@@ -193,7 +212,7 @@ int main(int argc, char** argv) {
         }
 
         // 保存cluster数据到fvecs文件
-        std::string cluster_filename = "cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
+        std::string cluster_filename = cluster_data_dir + "/cluster_" + std::to_string(cluster_id) + ".fvecs";
         std::ofstream cluster_file(cluster_filename, std::ios::binary);
         for (size_t i = 0; i < ids_in_cluster.size(); ++i) {
             cluster_file.write((char*)&dim, sizeof(dim));
@@ -232,7 +251,7 @@ int main(int argc, char** argv) {
         }
 
         // 保存图
-        std::string graph_filename = "nndescent/nndescent_" + std::to_string(cluster_id) + ".graph";
+        std::string graph_filename = nndescent_dir + "/nndescent_" + std::to_string(cluster_id) + ".graph";
         try {
             index.Save(graph_filename.c_str());
             std::cout << "Successfully saved graph to " << graph_filename << std::endl;

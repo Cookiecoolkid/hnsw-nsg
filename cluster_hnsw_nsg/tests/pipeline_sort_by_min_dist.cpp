@@ -157,7 +157,7 @@ bool load_cluster_specific_data_and_nsg(
     }
     std::vector<faiss::idx_t> id_mapping(points_num);
     mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
-    if (mapping_file.gcount() != points_num * sizeof(faiss::idx_t)) {
+    if ((unsigned)mapping_file.gcount() != points_num * sizeof(faiss::idx_t)) {
         std::cerr << "Thread " << omp_get_thread_num() << ": Error reading id_mapping file " << mapping_filename << std::endl;
         delete[] cluster_data;
         mapping_file.close();
@@ -241,29 +241,57 @@ int main(int argc, char** argv) {
     int correct = 0;
     int total = 0;
     auto start_time_search = std::chrono::high_resolution_clock::now();
+    double total_hnsw_search_time = 0.0; // 添加HNSW搜索总时间变量
 
-    #pragma omp parallel for
+    // 设置 omp 线程数
+    omp_set_num_threads(8);
+
+    #pragma omp parallel for reduction(+:total_hnsw_search_time)
     for (size_t i = 0; i < query_num; i++) {
         // 在HNSW图上搜索得到nprobe个点
         std::vector<float> query_distances(nprobe);
         std::vector<faiss::idx_t> query_labels(nprobe);
+        
+        // 记录HNSW搜索开始时间
+        auto start_hnsw_search = std::chrono::high_resolution_clock::now();
         index_hnsw->search(1, query_data.data() + i * query_dim, nprobe, 
                           query_distances.data(), query_labels.data());
+        // 记录HNSW搜索结束时间
+        auto end_hnsw_search = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> hnsw_search_time = end_hnsw_search - start_hnsw_search;
+        total_hnsw_search_time += hnsw_search_time.count();
 
-        // 统计每个cluster包含的样本点数量
-        std::map<faiss::idx_t, int> cluster_sample_count;
+        // 修改排序逻辑，使用样本点到查询点的距离
+        std::map<faiss::idx_t, float> cluster_min_dist; // 记录每个簇中最近样本点到查询点的距离
+        std::map<faiss::idx_t, int> cluster_sample_count; // 保留样本点计数，可能后续会用到
+
         for (int j = 0; j < nprobe; ++j) {
             faiss::idx_t point_id = query_labels[j];
-            faiss::idx_t cluster_id = point_id / (m + 1); // m is loaded from centroids.fvecs header
+            faiss::idx_t cluster_id = point_id / (m + 1);
             cluster_sample_count[cluster_id]++;
+            
+            // 计算当前样本点到查询点的距离
+            float dist = 0;
+            for (unsigned d = 0; d < query_dim; d++) {
+                float diff = query_data[i * query_dim + d] - centroids[point_id * query_dim + d];
+                dist += diff * diff;
+            }
+            
+            // 更新该簇的最小距离
+            if (cluster_min_dist.count(cluster_id)) {
+                cluster_min_dist[cluster_id] = std::min(cluster_min_dist[cluster_id], dist);
+            } else {
+                cluster_min_dist[cluster_id] = dist;
+            }
         }
 
-        std::vector<std::pair<faiss::idx_t, int>> sorted_clusters;
-        for (const auto& pair : cluster_sample_count) {
+        // 将cluster按最小距离排序
+        std::vector<std::pair<faiss::idx_t, float>> sorted_clusters;
+        for (const auto& pair : cluster_min_dist) {
             sorted_clusters.push_back(pair);
         }
         std::sort(sorted_clusters.begin(), sorted_clusters.end(),
-                 [](const auto& a, const auto& b) { return a.second > b.second; });
+                 [](const auto& a, const auto& b) { return a.second < b.second; });
 
         std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
         std::unordered_map<unsigned, float> global_id_to_dist_for_query; // Query-local results
@@ -272,23 +300,30 @@ int main(int argc, char** argv) {
 
         bool query_early_stopped = false;
 
-        // PASS 1: Search already loaded clusters
-        for (const auto& [cluster_id_pair, sample_count] : sorted_clusters) {
-            if (query_early_stopped) break;
-            faiss::idx_t cluster_id = cluster_id_pair;
+        // --- 处理第一个簇 (阻塞式加载和搜索) ---
+        if (!sorted_clusters.empty()) {
+            faiss::idx_t first_cluster_id = sorted_clusters[0].first;
+            bool first_cluster_load_successful = false;
 
-            bool is_loaded = false;
-            #pragma omp critical(map_read_check_pass1) 
-            { 
-                if (cluster_nsg_indices.count(cluster_id)) {
-                    is_loaded = true;
+            // 检查是否已加载，如果未加载，则阻塞式加载
+            #pragma omp critical(load_and_search_cluster_logic)
+            {
+                if (!cluster_nsg_indices.count(first_cluster_id)) {
+                    // std::cout << "Thread " << omp_get_thread_num() << ": First cluster " << first_cluster_id << " not loaded. Loading obstructively." << std::endl;
+                    if (load_cluster_specific_data_and_nsg(first_cluster_id, query_dim, cluster_data_map, id_mapping_map, cluster_nsg_indices)) {
+                        first_cluster_load_successful = true;
+                    } else {
+                        // std::cerr << "Thread " << omp_get_thread_num() << ": Failed to load critical first cluster " << first_cluster_id << std::endl;
+                    }
+                } else { // 已被其他线程或过程加载
+                    first_cluster_load_successful = true;
                 }
-            }
+            } // 结束临界区
 
-            if (is_loaded) {
-                efanna2e::IndexNSG* nsg_index = cluster_nsg_indices.at(cluster_id);
-                float* current_cluster_data = cluster_data_map.at(cluster_id);
-                const auto& current_id_mapping = id_mapping_map.at(cluster_id);
+            if (first_cluster_load_successful) {
+                efanna2e::IndexNSG* nsg_index = cluster_nsg_indices.at(first_cluster_id); // map::at会抛异常如果key不存在
+                float* current_cluster_data = cluster_data_map.at(first_cluster_id);
+                const auto& current_id_mapping = id_mapping_map.at(first_cluster_id);
                 
                 efanna2e::Parameters paras;
                 paras.Set<unsigned>("L_search", search_L);
@@ -304,8 +339,8 @@ int main(int argc, char** argv) {
                     if (local_id >= current_id_mapping.size()) continue;
                     unsigned global_id = current_id_mapping[local_id];
                     float dist = 0;
-                    for (int d = 0; d < query_dim; d++) {
-                        float diff = query_data[i * query_dim + d] - current_cluster_data[local_id * query_dim + d];
+                    for (unsigned d_idx = 0; d_idx < query_dim; d_idx++) { // Renamed d to d_idx
+                        float diff = query_data[i * query_dim + d_idx] - current_cluster_data[local_id * query_dim + d_idx];
                         dist += diff * diff;
                     }
                     cluster_min_dist = std::min(cluster_min_dist, dist);
@@ -315,7 +350,7 @@ int main(int argc, char** argv) {
                         global_id_to_dist_for_query[global_id] = dist;
                     }
                 }
-                if (cluster_min_dist >= current_min_max_dist_for_query && !global_id_to_dist_for_query.empty()) { // Check if empty before accessing
+                if (cluster_min_dist >= current_min_max_dist_for_query && !global_id_to_dist_for_query.empty()) {
                     query_early_stopped = true;
                 }
                 if (!global_id_to_dist_for_query.empty()) {
@@ -326,42 +361,40 @@ int main(int argc, char** argv) {
                          current_min_max_dist_for_query = std::min(current_min_max_dist_for_query, distances_vec[std::min((int)k - 1, (int)distances_vec.size() - 1)]);
                     }
                 }
-                // End of search logic for this cluster
-                searched_clusters_for_query.insert(cluster_id);
+                searched_clusters_for_query.insert(first_cluster_id);
             }
         }
+        // --- 第一个簇处理结束 ---
 
-        // PASS 2: Load and search remaining clusters if not early-stopped
-        if (!query_early_stopped) {
-            for (const auto& [cluster_id_pair, sample_count] : sorted_clusters) {
+
+        // --- 处理剩余的簇 ---
+        // PASS 1 (for remaining clusters): Search already loaded clusters
+        // Iterate from the second cluster onwards (index 1)
+        if (!query_early_stopped) { // Only proceed if query not already stopped
+            for (size_t cluster_idx = 1; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
                 if (query_early_stopped) break;
-                faiss::idx_t cluster_id = cluster_id_pair;
-                if (searched_clusters_for_query.count(cluster_id)) continue;
+                faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
+                // No need to check searched_clusters_for_query here for Pass 1,
+                // as first cluster is handled above, and this pass only looks for *already loaded* ones.
 
-                bool load_attempt_needed = true;
-                bool successfully_loaded_or_found = false;
-
-                #pragma omp critical(load_check_and_run_pass2)
-                {
-                    if (cluster_nsg_indices.count(cluster_id)) { // Check again, maybe loaded by another thread between passes
-                        successfully_loaded_or_found = true;
-                        load_attempt_needed = false;
-                    } else {
-                        // std::cout << "Thread " << omp_get_thread_num() << ": P2 attempting to load cluster " << cluster_id << std::endl;
-                        if (load_cluster_specific_data_and_nsg(cluster_id, query_dim, cluster_data_map, id_mapping_map, cluster_nsg_indices)) {
-                            successfully_loaded_or_found = true;
-                        } else {
-                            // std::cerr << "Thread " << omp_get_thread_num() << ": P2 failed to load " << cluster_id << std::endl;
-                        }
+                bool is_loaded = false;
+                #pragma omp critical(map_read_check_pass1_remaining) 
+                { 
+                    if (cluster_nsg_indices.count(cluster_id)) {
+                        is_loaded = true;
                     }
                 }
 
-                if (successfully_loaded_or_found) {
+                if (is_loaded) {
+                    // Ensure it wasn't the first cluster if by some chance it got re-evaluated
+                    // (though current logic for first cluster processing should prevent this for Pass 1)
+                    if (searched_clusters_for_query.count(cluster_id)) continue;
+
+
                     efanna2e::IndexNSG* nsg_index = cluster_nsg_indices.at(cluster_id);
                     float* current_cluster_data = cluster_data_map.at(cluster_id);
                     const auto& current_id_mapping = id_mapping_map.at(cluster_id);
-
-                    // ... (Actual search logic, update global_id_to_dist_for_query, current_min_max_dist_for_query) ...
+                    
                     efanna2e::Parameters paras;
                     paras.Set<unsigned>("L_search", search_L);
                     paras.Set<unsigned>("P_search", search_L);
@@ -376,8 +409,79 @@ int main(int argc, char** argv) {
                         if (local_id >= current_id_mapping.size()) continue;
                         unsigned global_id = current_id_mapping[local_id];
                         float dist = 0;
-                        for (int d = 0; d < query_dim; d++) {
-                            float diff = query_data[i * query_dim + d] - current_cluster_data[local_id * query_dim + d];
+                        for (unsigned d_idx = 0; d_idx < query_dim; d_idx++) { // Renamed d to d_idx
+                            float diff = query_data[i * query_dim + d_idx] - current_cluster_data[local_id * query_dim + d_idx];
+                            dist += diff * diff;
+                        }
+                        cluster_min_dist = std::min(cluster_min_dist, dist);
+                        if (global_id_to_dist_for_query.count(global_id)) {
+                            global_id_to_dist_for_query[global_id] = std::min(global_id_to_dist_for_query[global_id], dist);
+                        } else {
+                            global_id_to_dist_for_query[global_id] = dist;
+                        }
+                    }
+                    if (cluster_min_dist >= current_min_max_dist_for_query && !global_id_to_dist_for_query.empty()) { 
+                        query_early_stopped = true;
+                    }
+                    if (!global_id_to_dist_for_query.empty()) {
+                        std::vector<float> distances_vec;
+                        for(const auto& p : global_id_to_dist_for_query) distances_vec.push_back(p.second);
+                        std::sort(distances_vec.begin(), distances_vec.end());
+                        if (!distances_vec.empty()){
+                             current_min_max_dist_for_query = std::min(current_min_max_dist_for_query, distances_vec[std::min((int)k - 1, (int)distances_vec.size() - 1)]);
+                        }
+                    }
+                    searched_clusters_for_query.insert(cluster_id);
+                }
+            }
+        }
+
+        // PASS 2 (for remaining clusters): Load and search remaining clusters if not early-stopped
+        if (!query_early_stopped) {
+            // Iterate from the second cluster onwards (index 1)
+            for (size_t cluster_idx = 1; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
+                if (query_early_stopped) break;
+                faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
+                if (searched_clusters_for_query.count(cluster_id)) continue; // Already searched (either first cluster or in Pass 1 for remaining)
+
+                bool successfully_loaded_this_pass = false;
+
+                #pragma omp critical(load_check_and_run_pass2_remaining)
+                {
+                    // Double check if it got loaded by another thread between Pass 1 and Pass 2 for this query
+                    if (cluster_nsg_indices.count(cluster_id)) { 
+                        successfully_loaded_this_pass = true; 
+                    } else {
+                        // std::cout << "Thread " << omp_get_thread_num() << ": P2 for remaining, attempting to load cluster " << cluster_id << std::endl;
+                        if (load_cluster_specific_data_and_nsg(cluster_id, query_dim, cluster_data_map, id_mapping_map, cluster_nsg_indices)) {
+                            successfully_loaded_this_pass = true;
+                        } else {
+                            // std::cerr << "Thread " << omp_get_thread_num() << ": P2 for remaining, failed to load " << cluster_id << std::endl;
+                        }
+                    }
+                }
+
+                if (successfully_loaded_this_pass) {
+                    efanna2e::IndexNSG* nsg_index = cluster_nsg_indices.at(cluster_id);
+                    float* current_cluster_data = cluster_data_map.at(cluster_id);
+                    const auto& current_id_mapping = id_mapping_map.at(cluster_id);
+
+                    efanna2e::Parameters paras;
+                    paras.Set<unsigned>("L_search", search_L);
+                    paras.Set<unsigned>("P_search", search_L);
+                    paras.Set<unsigned>("K_search", search_K);
+                    std::vector<unsigned> tmp(search_K);
+                    nsg_index->Search(query_data.data() + i * query_dim, 
+                                    current_cluster_data, search_K, paras, tmp.data());
+
+                    float cluster_min_dist = std::numeric_limits<float>::max();
+                    for (int m_loop = 0; m_loop < search_K; m_loop++) {
+                        unsigned local_id = tmp[m_loop];
+                        if (local_id >= current_id_mapping.size()) continue;
+                        unsigned global_id = current_id_mapping[local_id];
+                        float dist = 0;
+                        for (unsigned d_idx = 0; d_idx < query_dim; d_idx++) { // Renamed d to d_idx
+                            float diff = query_data[i * query_dim + d_idx] - current_cluster_data[local_id * query_dim + d_idx];
                             dist += diff * diff;
                         }
                         cluster_min_dist = std::min(cluster_min_dist, dist);
@@ -398,13 +502,12 @@ int main(int argc, char** argv) {
                             current_min_max_dist_for_query = std::min(current_min_max_dist_for_query, distances_vec[std::min((int)k - 1, (int)distances_vec.size() - 1)]);
                         }
                     }
-                    // End of search logic for this cluster
-                    // searched_clusters_for_query.insert(cluster_id); // Not strictly needed here as we iterate all sorted_clusters once
-                } else {
-                    // Optional: log if a cluster marked for search couldn't be loaded at all
+                    searched_clusters_for_query.insert(cluster_id); 
                 }
             }
         }
+        // --- 处理剩余的簇结束 ---
+
 
         // Consolidate results for query i
         std::vector<std::pair<float, unsigned>> all_results_for_query;
@@ -417,7 +520,7 @@ int main(int argc, char** argv) {
                           all_results_for_query.end());
         std::vector<unsigned> final_results_for_query;
         final_results_for_query.reserve(k);
-        for (int m_final = 0; m_final < k && m_final < all_results_for_query.size(); m_final++) {
+        for (int m_final = 0; m_final < k && m_final < (int)all_results_for_query.size(); m_final++) {
             final_results_for_query.push_back(all_results_for_query[m_final].second);
         }
 
@@ -437,7 +540,8 @@ int main(int argc, char** argv) {
 
     auto end_time_search = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> search_time = end_time_search - start_time_search;
-    std::cout << "Search Time: " << search_time.count() << " seconds" << std::endl;
+    std::cout << "Total Search Time: " << search_time.count() << " seconds" << std::endl;
+    std::cout << "HNSW Navigation Graph Search Time: " << total_hnsw_search_time << " seconds" << std::endl;
     std::cout << "correct: " << correct << " total: " << total << std::endl;
     std::cout << "Recall Rate: " << static_cast<double>(correct) / total << std::endl;
 

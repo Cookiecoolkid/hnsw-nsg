@@ -31,11 +31,112 @@ struct SearchContext {
     unsigned query_dim;
     int search_K;
     int search_L;
-    int k;
+    unsigned k;
     std::string prefix;
 };
 
-// 新函数：按需加载指定cluster的数据和NSG索引
+// 加载cluster数据
+bool load_cluster_data(
+    int cluster_id,
+    unsigned global_dim,
+    float*& cluster_data,
+    unsigned& points_num,
+    const std::string& prefix) {
+    
+    std::string cluster_filename = prefix + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
+    unsigned dim_cluster_data;
+    std::ifstream in_cluster_data(cluster_filename, std::ios::binary);
+    if (!in_cluster_data.is_open()) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cannot open cluster file " << cluster_filename << std::endl;
+        return false;
+    }
+
+    in_cluster_data.read((char*)&dim_cluster_data, 4);
+    if (dim_cluster_data != global_dim) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Dimension mismatch in cluster file " << cluster_filename 
+                  << ". Expected " << global_dim << ", got " << dim_cluster_data << std::endl;
+        in_cluster_data.close();
+        return false;
+    }
+
+    in_cluster_data.seekg(0, std::ios::end);
+    size_t fsize_cluster_data = in_cluster_data.tellg();
+    points_num = fsize_cluster_data / ((dim_cluster_data + 1) * 4);
+
+    if (points_num == 0) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cluster " << cluster_id << " has 0 points in " << cluster_filename << std::endl;
+        in_cluster_data.close();
+        return false;
+    }
+
+    cluster_data = new (std::nothrow) float[points_num * dim_cluster_data];
+    if (!cluster_data) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Failed to allocate memory for cluster_data for cluster " << cluster_id << std::endl;
+        in_cluster_data.close();
+        return false;
+    }
+
+    in_cluster_data.seekg(0, std::ios::beg);
+    for (size_t i = 0; i < points_num; i++) {
+        in_cluster_data.seekg(4, std::ios::cur); // Skip dimension for each vector
+        in_cluster_data.read((char*)(cluster_data + i * dim_cluster_data), dim_cluster_data * sizeof(float));
+    }
+    in_cluster_data.close();
+    return true;
+}
+
+// 加载ID映射
+bool load_id_mapping(
+    int cluster_id,
+    unsigned points_num,
+    std::vector<faiss::idx_t>& id_mapping,
+    const std::string& prefix) {
+    
+    std::string mapping_filename = prefix + "/mapping/mapping_" + std::to_string(cluster_id);
+    std::ifstream mapping_file(mapping_filename, std::ios::binary);
+    if (!mapping_file.is_open()) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cannot open mapping file " << mapping_filename << std::endl;
+        return false;
+    }
+
+    id_mapping.resize(points_num);
+    mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
+    if ((unsigned)mapping_file.gcount() != points_num * sizeof(faiss::idx_t)) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error reading id_mapping file " << mapping_filename << std::endl;
+        mapping_file.close();
+        return false;
+    }
+    mapping_file.close();
+    return true;
+}
+
+// 加载NSG索引
+bool load_nsg_index(
+    int cluster_id,
+    unsigned dim,
+    unsigned points_num,
+    efanna2e::IndexNSG*& nsg_index,
+    const std::string& prefix) {
+    
+    nsg_index = new (std::nothrow) efanna2e::IndexNSG(dim, points_num, efanna2e::L2, nullptr);
+    if (!nsg_index) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Failed to allocate memory for nsg_index for cluster " << cluster_id << std::endl;
+        return false;
+    }
+
+    std::string nsg_filename = prefix + "/nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
+    try {
+        nsg_index->Load(nsg_filename.c_str());
+    } catch (const std::exception& e) {
+        std::cerr << "Thread " << omp_get_thread_num() << ": Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
+        delete nsg_index;
+        nsg_index = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// 按需加载指定cluster的数据和NSG索引
 bool load_cluster_specific_data_and_nsg(
     int cluster_id,
     unsigned global_dim,
@@ -45,74 +146,22 @@ bool load_cluster_specific_data_and_nsg(
     const std::string& prefix) {
 
     // 加载cluster数据
-    std::string cluster_filename = prefix + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".fvecs";
-    unsigned points_num, dim_cluster_data;
-    std::ifstream in_cluster_data(cluster_filename, std::ios::binary);
-    if (!in_cluster_data.is_open()) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cannot open cluster file " << cluster_filename << std::endl;
+    float* cluster_data = nullptr;
+    unsigned points_num = 0;
+    if (!load_cluster_data(cluster_id, global_dim, cluster_data, points_num, prefix)) {
         return false;
     }
-    in_cluster_data.read((char*)&dim_cluster_data, 4);
-    if (dim_cluster_data != global_dim) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Dimension mismatch in cluster file " << cluster_filename 
-                  << ". Expected " << global_dim << ", got " << dim_cluster_data << std::endl;
-        in_cluster_data.close();
-        return false;
-    }
-    in_cluster_data.seekg(0, std::ios::end);
-    size_t fsize_cluster_data = in_cluster_data.tellg();
-    points_num = fsize_cluster_data / ((dim_cluster_data + 1) * 4);
-
-    if (points_num == 0) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cluster " << cluster_id << " has 0 points in " << cluster_filename << std::endl;
-        in_cluster_data.close();
-        return false; // 不能处理空cluster
-    }
-
-    float* cluster_data = new (std::nothrow) float[points_num * dim_cluster_data];
-    if (!cluster_data) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Failed to allocate memory for cluster_data for cluster " << cluster_id << std::endl;
-        in_cluster_data.close();
-        return false;
-    }
-    in_cluster_data.seekg(0, std::ios::beg);
-    for (size_t i = 0; i < points_num; i++) {
-        in_cluster_data.seekg(4, std::ios::cur); // Skip dimension for each vector
-        in_cluster_data.read((char*)(cluster_data + i * dim_cluster_data), dim_cluster_data * sizeof(float));
-    }
-    in_cluster_data.close();
 
     // 加载ID映射
-    std::string mapping_filename = prefix + "/mapping/mapping_" + std::to_string(cluster_id);
-    std::ifstream mapping_file(mapping_filename, std::ios::binary);
-    if (!mapping_file.is_open()) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Cannot open mapping file " << mapping_filename << std::endl;
+    std::vector<faiss::idx_t> id_mapping;
+    if (!load_id_mapping(cluster_id, points_num, id_mapping, prefix)) {
         delete[] cluster_data;
         return false;
     }
-    std::vector<faiss::idx_t> id_mapping(points_num);
-    mapping_file.read((char*)id_mapping.data(), points_num * sizeof(faiss::idx_t));
-    if ((unsigned)mapping_file.gcount() != points_num * sizeof(faiss::idx_t)) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error reading id_mapping file " << mapping_filename << std::endl;
-        delete[] cluster_data;
-        mapping_file.close();
-        return false;
-    }
-    mapping_file.close();
 
-    // 创建并加载NSG索引
-    efanna2e::IndexNSG* nsg_index = new (std::nothrow) efanna2e::IndexNSG(dim_cluster_data, points_num, efanna2e::L2, nullptr);
-    if (!nsg_index) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error: Failed to allocate memory for nsg_index for cluster " << cluster_id << std::endl;
-        delete[] cluster_data;
-        return false;
-    }
-    std::string nsg_filename = prefix + "/nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
-    try {
-        nsg_index->Load(nsg_filename.c_str());
-    } catch (const std::exception& e) {
-        std::cerr << "Thread " << omp_get_thread_num() << ": Error loading NSG from " << nsg_filename << ": " << e.what() << std::endl;
-        delete nsg_index;
+    // 加载NSG索引
+    efanna2e::IndexNSG* nsg_index = nullptr;
+    if (!load_nsg_index(cluster_id, global_dim, points_num, nsg_index, prefix)) {
         delete[] cluster_data;
         return false;
     }
@@ -195,7 +244,7 @@ std::vector<std::pair<faiss::idx_t, int>> search_hnsw_and_sort_clusters(
 void merge_topk_queue(
     std::priority_queue<std::pair<float, unsigned>>& target_queue,
     std::priority_queue<std::pair<float, unsigned>>& source_queue,
-    int k) {
+    unsigned k) {
     
     // 将source_queue中的所有元素添加到target_queue
     while (!source_queue.empty()) {
@@ -218,7 +267,7 @@ void search_nsg_cluster(
     const float* query_data,
     std::priority_queue<std::pair<float, unsigned>>& local_queue,
     float& local_max_dist,
-    std::atomic<bool>& query_early_stopped) {
+    bool& query_early_stopped) {
 
     efanna2e::IndexNSG* nsg_index = ctx.cluster_nsg_indices.at(cluster_id);
     float* current_cluster_data = ctx.cluster_data_map.at(cluster_id);
@@ -235,7 +284,6 @@ void search_nsg_cluster(
     std::unordered_map<unsigned, float> local_results;
 
     // 计算当前cluster中所有点的距离
-    
     for (int m_loop = 0; m_loop < ctx.search_K; m_loop++) {
         unsigned local_id = tmp[m_loop];
         if (local_id >= current_id_mapping.size()) continue;
@@ -266,14 +314,14 @@ void search_nsg_cluster(
 
     // 如果当前cluster的最小距离大于等于当前topk中的最大距离，且队列已满，则提前停止
     if (cluster_min_dist >= local_max_dist && local_queue.size() >= ctx.k) {
-        query_early_stopped.store(true);
+        query_early_stopped = true;
     }
 }
 
 // 处理搜索结果
 std::vector<unsigned> process_search_results(
     std::priority_queue<std::pair<float, unsigned>>& topk_queue,
-    int k) {
+    unsigned k) {
     
     std::vector<unsigned> final_results;
     final_results.reserve(k);
@@ -288,7 +336,7 @@ std::vector<unsigned> process_search_results(
     std::sort(sorted_results.begin(), sorted_results.end());
     
     // 提取前k个结果
-    for (int i = 0; i < k && i < sorted_results.size(); i++) {
+    for (unsigned i = 0; i < k && i < sorted_results.size(); i++) {
         final_results.push_back(sorted_results[i].second);
     }
     
@@ -337,97 +385,99 @@ int main(int argc, char** argv) {
                   << " k: " << ctx.k << std::endl;
 
         // 搜索过程
-        int correct = 0;
-        int total = 0;
+        std::atomic<int> correct{0};
+        std::atomic<int> total{0};
         auto start_time_search = std::chrono::high_resolution_clock::now();
-        auto total_hnsw_search_time = 0.0;
+        std::atomic<double> total_hnsw_search_time{0.0};
 
         // 设置 omp 线程数
         omp_set_num_threads(8);
 
-        // 串行处理每个查询
-        // #pragma omp parallel for schedule(dynamic)
-        for (size_t i = 0; i < query_num; i++) {
-            // 在HNSW图上搜索并获取排序后的cluster
-            auto start_time_hnsw_search = std::chrono::high_resolution_clock::now();
-            auto sorted_clusters = search_hnsw_and_sort_clusters(ctx, query_data.data() + i * ctx.query_dim, nprobe);
-            auto end_time_hnsw_search = std::chrono::high_resolution_clock::now();
-            auto hnsw_search_time = std::chrono::duration_cast<std::chrono::duration<double>>(end_time_hnsw_search - start_time_hnsw_search);
-            total_hnsw_search_time += hnsw_search_time.count();
+        // 并行处理每个查询
+        #pragma omp parallel
+        {
+            // 每个线程维护自己的统计信息
+            int local_correct = 0;
+            int local_total = 0;
+            double local_hnsw_time = 0.0;
+            std::mutex queue_mutex;  // 为每个线程创建自己的mutex
 
-            std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
-            std::priority_queue<std::pair<float, unsigned>> topk_queue;
-            std::atomic<float> current_min_max_dist_for_query{std::numeric_limits<float>::max()};
-            std::mutex queue_mutex;
-            std::atomic<bool> query_early_stopped{false};
+            #pragma omp for schedule(dynamic)
+            for (size_t i = 0; i < query_num; i++) {
+                // 在HNSW图上搜索并获取排序后的cluster
+                auto start_time_hnsw_search = std::chrono::high_resolution_clock::now();
+                auto sorted_clusters = search_hnsw_and_sort_clusters(ctx, query_data.data() + i * ctx.query_dim, nprobe);
+                auto end_time_hnsw_search = std::chrono::high_resolution_clock::now();
+                auto hnsw_search_time = std::chrono::duration_cast<std::chrono::duration<double>>(end_time_hnsw_search - start_time_hnsw_search);
+                local_hnsw_time += hnsw_search_time.count();
 
-            // 使用OpenMP task进行并行加载和搜索
-            #pragma omp parallel
-            {
-                #pragma omp single
-                {
-                    for (size_t cluster_idx = 0; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
-                        if (query_early_stopped.load()) break;
+                std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
+                std::priority_queue<std::pair<float, unsigned>> topk_queue;
+                float current_min_max_dist = std::numeric_limits<float>::max();
+                bool query_early_stopped = false;
 
-                        faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
-                        
-                        // 创建加载任务
-                        #pragma omp task
+                // 使用OpenMP parallel for并行处理clusters
+                #pragma omp parallel for schedule(dynamic)
+                for (size_t cluster_idx = 0; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
+                    if (query_early_stopped) continue;
+
+                    faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
+                    
+                    // 加载cluster数据
+                    bool success_load = false;
+                    {
+                        #pragma omp critical(cluster_load)
                         {
-                            bool success_load = false;
-                            {
-                                #pragma omp critical(cluster_load)
-                                {
-                                    if (!ctx.cluster_nsg_indices.count(cluster_id)) {
-                                        success_load = load_cluster_specific_data_and_nsg(
-                                            cluster_id, ctx.query_dim,
-                                            ctx.cluster_data_map, ctx.id_mapping_map,
-                                            ctx.cluster_nsg_indices, ctx.prefix);
-                                    } else {
-                                        success_load = true;
-                                    }
-                                }
-                            }
-
-                            if (success_load) {
-                                // 创建搜索任务
-                                #pragma omp task
-                                {
-                                    if (!query_early_stopped.load()) {
-                                        std::priority_queue<std::pair<float, unsigned>> local_queue;
-                                        float local_max_dist = current_min_max_dist_for_query.load();
-
-                                        search_nsg_cluster(ctx, cluster_id, 
-                                                         query_data.data() + i * ctx.query_dim,
-                                                         local_queue, local_max_dist, 
-                                                         query_early_stopped);
-
-                                        // 合并结果
-                                        {
-                                            std::lock_guard<std::mutex> guard(queue_mutex);
-                                            merge_topk_queue(topk_queue, local_queue, ctx.k);
-                                            current_min_max_dist_for_query = topk_queue.top().first;
-                                        }
-                                    }
-                                }
+                            if (!ctx.cluster_nsg_indices.count(cluster_id)) {
+                                success_load = load_cluster_specific_data_and_nsg(
+                                    cluster_id, ctx.query_dim,
+                                    ctx.cluster_data_map, ctx.id_mapping_map,
+                                    ctx.cluster_nsg_indices, ctx.prefix);
+                            } else {
+                                success_load = true;
                             }
                         }
                     }
+
+                    if (success_load && !query_early_stopped) {
+                        std::priority_queue<std::pair<float, unsigned>> local_queue;
+                        float local_max_dist = current_min_max_dist;
+
+                        search_nsg_cluster(ctx, cluster_id, 
+                                         query_data.data() + i * ctx.query_dim,
+                                         local_queue, local_max_dist, 
+                                         query_early_stopped);
+
+                        // 合并结果
+                        {
+                            std::lock_guard<std::mutex> guard(queue_mutex);
+                            merge_topk_queue(topk_queue, local_queue, ctx.k);
+                            current_min_max_dist = topk_queue.top().first;
+                        }
+                    }
                 }
+
+                // 处理搜索结果
+                auto final_results = process_search_results(topk_queue, ctx.k);
+                
+                // 计算recall
+                int query_correct_count = calculate_query_recall(final_results, ground_truth_set);
+                local_correct += query_correct_count;
+                local_total += ground_truth_set.size();
             }
 
-            // 处理搜索结果
-            auto final_results = process_search_results(topk_queue, ctx.k);
-            
-            // 计算recall
-            int query_correct_count = calculate_query_recall(final_results, ground_truth_set);
-            correct += query_correct_count;
-            total += ground_truth_set.size();
+            // 合并线程本地统计信息
+            #pragma omp critical(update_stats)
+            {
+                correct += local_correct;
+                total += local_total;
+                total_hnsw_search_time.store(total_hnsw_search_time.load() + local_hnsw_time);
+            }
         }
 
         auto end_time_search = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> search_time = end_time_search - start_time_search;
-        std::cout << "Total HNSW Search Time: " << total_hnsw_search_time << " seconds" << std::endl;
+        std::cout << "Total HNSW Search Time: " << total_hnsw_search_time.load() << " seconds" << std::endl;
         std::cout << "Total Search Time: " << search_time.count() << " seconds" << std::endl;
         std::cout << "correct: " << correct << " total: " << total << std::endl;
         std::cout << "Recall Rate: " << static_cast<double>(correct) / total << std::endl;

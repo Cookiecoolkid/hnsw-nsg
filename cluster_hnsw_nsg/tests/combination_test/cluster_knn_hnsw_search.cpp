@@ -238,7 +238,6 @@ int main(int argc, char** argv) {
             }
 
             faiss::IndexHNSWFlat* cluster_index = cluster_hnsw_indices[cluster_id];
-            float* cluster_data = cluster_data_map[cluster_id];
             const auto& id_mapping = id_mapping_map[cluster_id];
 
             // 搜索
@@ -299,7 +298,7 @@ int main(int argc, char** argv) {
         // 选择前k个结果
         std::vector<unsigned> final_results;
         final_results.reserve(k);
-        for (int m = 0; m < k && m < all_results.size(); m++) {
+        for (int m = 0; m < k && m < (int)all_results.size(); m++) {
             final_results.push_back(all_results[m].second);
         }
 

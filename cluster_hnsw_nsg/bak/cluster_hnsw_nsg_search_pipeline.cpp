@@ -17,8 +17,6 @@
 #include <unordered_map>
 #include <omp.h>
 #include <aux_util.h>
-#include <atomic>
-#include <mutex>
 
 // 数据结构定义
 struct SearchContext {
@@ -191,34 +189,14 @@ std::vector<std::pair<faiss::idx_t, int>> search_hnsw_and_sort_clusters(
     return sorted_clusters;
 }
 
-// 合并两个优先队列
-void merge_topk_queue(
-    std::priority_queue<std::pair<float, unsigned>>& target_queue,
-    std::priority_queue<std::pair<float, unsigned>>& source_queue,
-    int k) {
-    
-    // 将source_queue中的所有元素添加到target_queue
-    while (!source_queue.empty()) {
-        auto [dist, id] = source_queue.top();
-        source_queue.pop();
-        
-        if (target_queue.size() < k) {
-            target_queue.push({dist, id});
-        } else if (dist < target_queue.top().first) {
-            target_queue.pop();
-            target_queue.push({dist, id});
-        }
-    }
-}
-
 // 在NSG上搜索单个cluster
 void search_nsg_cluster(
     const SearchContext& ctx,
     faiss::idx_t cluster_id,
     const float* query_data,
-    std::priority_queue<std::pair<float, unsigned>>& local_queue,
-    float& local_max_dist,
-    std::atomic<bool>& query_early_stopped) {
+    std::priority_queue<std::pair<float, unsigned>>& topk_queue,
+    float& current_min_max_dist,
+    bool& query_early_stopped) {
 
     efanna2e::IndexNSG* nsg_index = ctx.cluster_nsg_indices.at(cluster_id);
     float* current_cluster_data = ctx.cluster_data_map.at(cluster_id);
@@ -235,7 +213,6 @@ void search_nsg_cluster(
     std::unordered_map<unsigned, float> local_results;
 
     // 计算当前cluster中所有点的距离
-    
     for (int m_loop = 0; m_loop < ctx.search_K; m_loop++) {
         unsigned local_id = tmp[m_loop];
         if (local_id >= current_id_mapping.size()) continue;
@@ -249,24 +226,27 @@ void search_nsg_cluster(
         local_results[global_id] = dist;
     }
 
-    // 更新本地优先队列
+    // 更新优先队列
     for (const auto& [global_id, dist] : local_results) {
-        if (local_queue.size() < ctx.k) {
-            local_queue.push({dist, global_id});
-        } else if (dist < local_queue.top().first) {
-            local_queue.pop();
-            local_queue.push({dist, global_id});
+        // 如果队列未满，直接添加
+        if (topk_queue.size() < ctx.k) {
+            topk_queue.push({dist, global_id});
+        }
+        // 如果队列已满且当前距离小于队列中最大距离，则替换
+        else if (dist < topk_queue.top().first) {
+            topk_queue.pop();
+            topk_queue.push({dist, global_id});
         }
     }
 
-    // 更新local_max_dist
-    if (!local_queue.empty()) {
-        local_max_dist = local_queue.top().first;
+    // 更新current_min_max_dist为当前队列中的最大距离
+    if (!topk_queue.empty()) {
+        current_min_max_dist = topk_queue.top().first;
     }
 
     // 如果当前cluster的最小距离大于等于当前topk中的最大距离，且队列已满，则提前停止
-    if (cluster_min_dist >= local_max_dist && local_queue.size() >= ctx.k) {
-        query_early_stopped.store(true);
+    if (cluster_min_dist >= current_min_max_dist && topk_queue.size() >= ctx.k) {
+        query_early_stopped = true;
     }
 }
 
@@ -340,94 +320,100 @@ int main(int argc, char** argv) {
         int correct = 0;
         int total = 0;
         auto start_time_search = std::chrono::high_resolution_clock::now();
-        auto total_hnsw_search_time = 0.0;
 
         // 设置 omp 线程数
         omp_set_num_threads(8);
 
-        // 串行处理每个查询
-        // #pragma omp parallel for schedule(dynamic)
-        for (size_t i = 0; i < query_num; i++) {
-            // 在HNSW图上搜索并获取排序后的cluster
-            auto start_time_hnsw_search = std::chrono::high_resolution_clock::now();
-            auto sorted_clusters = search_hnsw_and_sort_clusters(ctx, query_data.data() + i * ctx.query_dim, nprobe);
-            auto end_time_hnsw_search = std::chrono::high_resolution_clock::now();
-            auto hnsw_search_time = std::chrono::duration_cast<std::chrono::duration<double>>(end_time_hnsw_search - start_time_hnsw_search);
-            total_hnsw_search_time += hnsw_search_time.count();
+        #pragma omp parallel
+        {
+            #pragma omp for
+            for (size_t i = 0; i < query_num; i++) {
+                // 在HNSW图上搜索并获取排序后的cluster
+                auto sorted_clusters = search_hnsw_and_sort_clusters(ctx, query_data.data() + i * ctx.query_dim, nprobe);
 
-            std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
-            std::priority_queue<std::pair<float, unsigned>> topk_queue;
-            std::atomic<float> current_min_max_dist_for_query{std::numeric_limits<float>::max()};
-            std::mutex queue_mutex;
-            std::atomic<bool> query_early_stopped{false};
+                std::unordered_set<unsigned> ground_truth_set(ground_truth[i].begin(), ground_truth[i].end());
+                std::priority_queue<std::pair<float, unsigned>> topk_queue;
+                float current_min_max_dist_for_query = std::numeric_limits<float>::max();
+                std::unordered_set<faiss::idx_t> searched_clusters_for_query;
+                bool query_early_stopped = false;
 
-            // 使用OpenMP task进行并行加载和搜索
-            #pragma omp parallel
-            {
-                #pragma omp single
-                {
-                    for (size_t cluster_idx = 0; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
-                        if (query_early_stopped.load()) break;
+                // 处理第一个簇
+                if (!sorted_clusters.empty()) {
+                    faiss::idx_t first_cluster_id = sorted_clusters[0].first;
+                    bool first_cluster_load_successful = false;
 
-                        faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
-                        
-                        // 创建加载任务
-                        #pragma omp task
-                        {
-                            bool success_load = false;
-                            {
-                                #pragma omp critical(cluster_load)
-                                {
-                                    if (!ctx.cluster_nsg_indices.count(cluster_id)) {
-                                        success_load = load_cluster_specific_data_and_nsg(
-                                            cluster_id, ctx.query_dim,
-                                            ctx.cluster_data_map, ctx.id_mapping_map,
-                                            ctx.cluster_nsg_indices, ctx.prefix);
-                                    } else {
-                                        success_load = true;
-                                    }
-                                }
+                    #pragma omp critical(load_and_search_cluster_logic)
+                    {
+                        if (!ctx.cluster_nsg_indices.count(first_cluster_id)) {
+                            if (load_cluster_specific_data_and_nsg(first_cluster_id, ctx.query_dim, 
+                                                                ctx.cluster_data_map, ctx.id_mapping_map, 
+                                                                ctx.cluster_nsg_indices, ctx.prefix)) {
+                                first_cluster_load_successful = true;
                             }
+                        } else {
+                            first_cluster_load_successful = true;
+                        }
+                    }
 
-                            if (success_load) {
-                                // 创建搜索任务
-                                #pragma omp task
-                                {
-                                    if (!query_early_stopped.load()) {
-                                        std::priority_queue<std::pair<float, unsigned>> local_queue;
-                                        float local_max_dist = current_min_max_dist_for_query.load();
+                    if (first_cluster_load_successful) {
+                        search_nsg_cluster(ctx, first_cluster_id, query_data.data() + i * ctx.query_dim,
+                                         topk_queue, current_min_max_dist_for_query,
+                                         query_early_stopped);
+                        searched_clusters_for_query.insert(first_cluster_id);
+                    }
+                }
 
-                                        search_nsg_cluster(ctx, cluster_id, 
-                                                         query_data.data() + i * ctx.query_dim,
-                                                         local_queue, local_max_dist, 
-                                                         query_early_stopped);
+                // 处理剩余的簇
+                if (!query_early_stopped) {
+                    for (size_t cluster_idx = 1; cluster_idx < sorted_clusters.size(); ++cluster_idx) {
+                        if (query_early_stopped) break;
+                        faiss::idx_t cluster_id = sorted_clusters[cluster_idx].first;
+                        if (searched_clusters_for_query.count(cluster_id)) continue;
 
-                                        // 合并结果
-                                        {
-                                            std::lock_guard<std::mutex> guard(queue_mutex);
-                                            merge_topk_queue(topk_queue, local_queue, ctx.k);
-                                            current_min_max_dist_for_query = topk_queue.top().first;
-                                        }
+                        bool is_loaded = false;
+                        #pragma omp critical(map_read_check_pass1_remaining)
+                        {
+                            is_loaded = ctx.cluster_nsg_indices.count(cluster_id) > 0;
+                        }
+
+                        if (is_loaded) {
+                            search_nsg_cluster(ctx, cluster_id, query_data.data() + i * ctx.query_dim,
+                                             topk_queue, current_min_max_dist_for_query,
+                                             query_early_stopped);
+                            searched_clusters_for_query.insert(cluster_id);
+                        } else {
+                            bool successfully_loaded_this_pass = false;
+                            #pragma omp critical(load_check_and_run_pass2_remaining)
+                            {
+                                if (!ctx.cluster_nsg_indices.count(cluster_id)) {
+                                    if (load_cluster_specific_data_and_nsg(cluster_id, ctx.query_dim,
+                                                                        ctx.cluster_data_map, ctx.id_mapping_map,
+                                                                        ctx.cluster_nsg_indices, ctx.prefix)) {
+                                        successfully_loaded_this_pass = true;
                                     }
+                                } else {
+                                    successfully_loaded_this_pass = true;
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // 处理搜索结果
-            auto final_results = process_search_results(topk_queue, ctx.k);
-            
-            // 计算recall
-            int query_correct_count = calculate_query_recall(final_results, ground_truth_set);
-            correct += query_correct_count;
-            total += ground_truth_set.size();
+                // 处理搜索结果
+                auto final_results = process_search_results(topk_queue, ctx.k);
+                
+                // 计算recall
+                int query_correct_count = calculate_query_recall(final_results, ground_truth_set);
+                #pragma omp critical(update_recall_counts)
+                {
+                    correct += query_correct_count;
+                    total += ground_truth_set.size();
+                }
+            }
         }
 
         auto end_time_search = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> search_time = end_time_search - start_time_search;
-        std::cout << "Total HNSW Search Time: " << total_hnsw_search_time << " seconds" << std::endl;
         std::cout << "Total Search Time: " << search_time.count() << " seconds" << std::endl;
         std::cout << "correct: " << correct << " total: " << total << std::endl;
         std::cout << "Recall Rate: " << static_cast<double>(correct) / total << std::endl;

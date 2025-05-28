@@ -33,31 +33,38 @@ void load_data(const std::string& filename, float*& data, unsigned& num, unsigne
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <L> <R> <C>" << std::endl;
+    if (argc != 5) {
+        std::cerr << "Usage: " << argv[0] << " <L> <R> <C> <prefix>" << std::endl;
         std::cerr << "  L: number of candidates in NSG (default: 40)" << std::endl;
         std::cerr << "  R: maximum degree of each node (default: 50)" << std::endl;
         std::cerr << "  C: number of candidates in NSG (default: 500)" << std::endl;
+        std::cerr << "  prefix: prefix directory for input/output files" << std::endl;
         return 1;
     }
 
     unsigned L = (unsigned)atoi(argv[1]);
     unsigned R = (unsigned)atoi(argv[2]);
     unsigned C = (unsigned)atoi(argv[3]);
+    std::string prefix = argv[4];
+
+    // 创建nsg_graph目录
+    std::string nsg_graph_dir = prefix + "/nsg_graph";
+    auto ret = system(("mkdir -p " + nsg_graph_dir).c_str());
+    if (ret == -1) {
+        std::cerr << "Error creating directory " << nsg_graph_dir << std::endl;
+        return 1;
+    }
+
+    // 修改目录路径
+    std::string cluster_data_dir = prefix + "/cluster_data";
+    std::string nndescent_dir = prefix + "/nndescent";
 
     // 加载所有cluster数据
     DIR* dir;
     struct dirent* ent;
     std::regex pattern("cluster_(\\d+)\\.fvecs");
 
-    // 创建nsg_graph目录
-    auto ret = system("mkdir -p nsg_graph");
-    if (ret == -1) {
-        std::cerr << "Error creating directory nsg_graph" << std::endl;
-        return 1;
-    }
-
-    if ((dir = opendir("cluster_data")) != NULL) {
+    if ((dir = opendir(cluster_data_dir.c_str())) != NULL) {
         while ((ent = readdir(dir)) != NULL) {
             std::string filename = ent->d_name;
             std::smatch matches;
@@ -65,7 +72,7 @@ int main(int argc, char** argv) {
                 int cluster_id = std::stoi(matches[1]);
                 
                 // 加载cluster数据
-                std::string cluster_filename = "cluster_data/" + filename;
+                std::string cluster_filename = cluster_data_dir + "/" + filename;
                 float* cluster_data = nullptr;
                 unsigned points_num, dim;
                 load_data(cluster_filename, cluster_data, points_num, dim);
@@ -79,7 +86,8 @@ int main(int argc, char** argv) {
                 paras.Set<unsigned>("L", L);
                 paras.Set<unsigned>("R", R);
                 paras.Set<unsigned>("C", C);
-                paras.Set<std::string>("nn_graph_path", "nndescent/nndescent_" + std::to_string(cluster_id) + ".graph");
+                paras.Set<std::string>("nn_graph_path", 
+                    nndescent_dir + "/nndescent_" + std::to_string(cluster_id) + ".graph");
 
                 std::cout << "NSG parameters for cluster " << cluster_id << ":" << std::endl
                           << "  L: " << L << std::endl
@@ -100,7 +108,7 @@ int main(int argc, char** argv) {
                 }
 
                 // 保存NSG
-                std::string nsg_filename = "nsg_graph/nsg_" + std::to_string(cluster_id) + ".nsg";
+                std::string nsg_filename = nsg_graph_dir + "/nsg_" + std::to_string(cluster_id) + ".nsg";
                 try {
                     index.Save(nsg_filename.c_str());
                     std::cout << "Successfully saved NSG to " << nsg_filename << std::endl;
