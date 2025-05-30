@@ -3,6 +3,7 @@ dataset/
 data/
 
 *.o
+*.o.d
 *.a
 *.so
 *.log
