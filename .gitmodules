@@ -1,0 +1,3 @@
+[submodule "CNNS/efanna_graph/extern_libraries/faiss"]
+	path = CNNS/efanna_graph/extern_libraries/faiss
+	url = https://github.com/facebookresearch/faiss.git
