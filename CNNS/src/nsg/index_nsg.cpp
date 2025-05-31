@@ -5,6 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <boost/dynamic_bitset.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "exceptions.h"
 #include "parameters.h"
@@ -62,6 +66,65 @@ void IndexNSG::Load(const char *filename) {
   cc /= nd_;
   // std::cout<<cc<<std::endl;
 }
+
+void IndexNSG::Load_mmap(const char *filename) {
+  int fd = open(filename, O_RDONLY);
+  if (fd == -1) {
+    std::cerr << "Error: Cannot open file " << filename << std::endl;
+    exit(EXIT_FAILURE);
+  }
+
+  struct stat sb;
+  if (fstat(fd, &sb) == -1) {
+    std::cerr << "Error: fstat failed on " << filename << std::endl;
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
+  size_t filesize = sb.st_size;
+  void* filedata = mmap(NULL, filesize, PROT_READ, MAP_SHARED, fd, 0);
+  if (filedata == MAP_FAILED) {
+    std::cerr << "Error: mmap failed on " << filename << std::endl;
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
+  const char* ptr = reinterpret_cast<const char*>(filedata);
+  const char* end = ptr + filesize;
+
+  // Read width and ep_
+  std::memcpy(&width, ptr, sizeof(unsigned));
+  ptr += sizeof(unsigned);
+  std::memcpy(&ep_, ptr, sizeof(unsigned));
+  ptr += sizeof(unsigned);
+
+  final_graph_.clear();
+  unsigned node_idx = 0;
+  size_t cc = 0;
+
+  while (ptr + sizeof(unsigned) <= end && node_idx < nd_) {
+    unsigned k;
+    std::memcpy(&k, ptr, sizeof(unsigned));
+    ptr += sizeof(unsigned);
+
+    if (ptr + k * sizeof(unsigned) > end) {
+      std::cerr << "Error: unexpected end of file while reading neighbors for node " << node_idx << std::endl;
+      break;
+    }
+
+    std::vector<unsigned> neighbors(k);
+    std::memcpy(neighbors.data(), ptr, k * sizeof(unsigned));
+    ptr += k * sizeof(unsigned);
+
+    cc += k;
+    final_graph_.push_back(std::move(neighbors));
+    ++node_idx;
+  }
+
+  munmap(filedata, filesize);
+  close(fd);
+}
+
 void IndexNSG::Load_nn_graph(const char *filename) {
   std::ifstream in(filename, std::ios::binary);
   unsigned k;

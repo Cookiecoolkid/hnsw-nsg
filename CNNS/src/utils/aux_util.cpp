@@ -81,39 +81,4 @@ std::vector<float> load_centroids(const std::string& filename, int& n_clusters, 
     return centroids;
 }
 
-float compute_l2_distance(const float* a, const float* b, unsigned dim) {
-    float sum = 0.0f;
-    for (unsigned i = 0; i < dim; ++i) {
-        float diff = a[i] - b[i];
-        sum += diff * diff;
-    }
-    return std::sqrt(sum);
-}
-
-float compute_cosine_similarity(const float* a, const float* b, unsigned dim) {
-    float dot_product = 0.0f;
-    float norm_a = 0.0f;
-    float norm_b = 0.0f;
-    
-    for (unsigned i = 0; i < dim; ++i) {
-        dot_product += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    
-    return dot_product / (std::sqrt(norm_a) * std::sqrt(norm_b));
-}
-
-float compute_inner_product(const float* a, const float* b, unsigned dim) {
-    float sum = 0.0f;
-    for (unsigned i = 0; i < dim; ++i) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
-
-float compute_cosine_distance(const float* a, const float* b, unsigned dim) {
-    return 1.0f - compute_cosine_similarity(a, b, dim);
-}
-
 } // namespace CNNS

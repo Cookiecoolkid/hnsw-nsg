@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SOURCES
     index_build.cpp
     index_search.cpp
+    data_mmap.cpp
 )
 
 # 创建库目标

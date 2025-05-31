@@ -4,6 +4,8 @@
 #include <iostream>
 #include <random>
 #include <algorithm>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 namespace CNNS {
 
@@ -209,6 +211,8 @@ bool IndexBuilder<T>::saveNSG(efanna2e::IndexNSG& index,
         return false;
     }
 }
+
+
 
 // 显式实例化模板类
 template class IndexBuilder<float>;

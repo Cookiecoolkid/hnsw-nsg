@@ -6,6 +6,10 @@
 #include <faiss/index_io.h>
 #include <efanna2e/index_graph.h>
 #include <efanna2e/index_random.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "nsg/neighbor.h"
 #include "nsg/index_nsg.h"
